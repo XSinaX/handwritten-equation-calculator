@@ -1,0 +1,80 @@
+# ==================================================
+# API
+# ==================================================
+
+# Virtual environment
+/api/api_venv/
+
+# Python-generated files
+/api/**/__pycache__/
+/api/**/*.py[cod]
+
+
+# ==================================================
+# ML
+# ==================================================
+
+# Virtual environment
+/ml/ml_venv/
+
+# Python-generated files
+/ml/**/__pycache__/
+/ml/**/*.py[cod]
+
+
+# ==================================================
+# WEB
+# ==================================================
+
+# Dependencies
+/web/node_modules/
+/web/.pnp
+/web/.pnp.*
+/web/.yarn/*
+!/web/.yarn/patches
+!/web/.yarn/plugins
+!/web/.yarn/releases
+!/web/.yarn/versions
+
+# Testing
+/web/coverage/
+
+# Next.js
+/web/.next/
+/web/out/
+
+# Production
+/web/build/
+
+# Miscellaneous
+/web/**/.DS_Store
+/web/**/*.pem
+
+# Debug
+/web/npm-debug.log*
+/web/yarn-debug.log*
+/web/yarn-error.log*
+/web/.pnpm-debug.log*
+
+# Vercel
+/web/.vercel/
+
+# TypeScript
+/web/*.tsbuildinfo
+/web/next-env.d.ts
+
+
+# ==================================================
+# GENERAL
+# ==================================================
+
+# Shared environment file
+/.env
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+/.idea/
+/.vscode/
