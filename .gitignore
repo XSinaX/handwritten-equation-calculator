@@ -14,12 +14,27 @@
 # ML
 # ==================================================
 
-# Virtual environment
+# Virtual environments (covers ml_venv, .venv, venv, etc. at any depth)
 /ml/ml_venv/
+/ml/**/.venv/
+/ml/**/venv/
 
 # Python-generated files
 /ml/**/__pycache__/
 /ml/**/*.py[cod]
+
+# Processed / generated image outputs (large, regeneratable — don't commit)
+/ml/**/data_processed/
+/ml/**/dataset_processed/
+/ml/**/*_processed/
+/ml/**/*_output/
+
+# Raw dataset (large — reference via README/download link instead of committing)
+/ml/**/data/
+/ml/**/dataset/
+
+# Jupyter
+/ml/**/.ipynb_checkpoints/
 
 
 # ==================================================
@@ -78,3 +93,7 @@ Thumbs.db
 # IDE settings
 /.idea/
 /.vscode/
+
+# API keys / secrets
+API KEY
+*.key
