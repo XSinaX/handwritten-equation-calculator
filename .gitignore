@@ -14,7 +14,7 @@
 # ML
 # ==================================================
 
-# Virtual environments (covers ml_venv, .venv, venv, etc. at any depth)
+# Virtual environments 
 /ml/ml_venv/
 /ml/**/.venv/
 /ml/**/venv/
@@ -23,7 +23,7 @@
 /ml/**/__pycache__/
 /ml/**/*.py[cod]
 
-# Processed / generated image outputs (large, regeneratable — don't commit)
+# Processed / generated image outputs 
 /ml/**/data_processed/
 /ml/**/dataset_processed/
 /ml/**/*_processed/
