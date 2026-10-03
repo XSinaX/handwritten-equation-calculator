@@ -24,9 +24,8 @@ Run from the project root:
 py -m venv api\api_venv
 .\api\api_venv\Scripts\Activate.ps1
 python -m pip install -r api\requirements.txt
+python -m uvicorn app.main:app --reload
 ```
-
-Use `deactivate` to leave the environment.
 
 ## ML setup
 
@@ -36,6 +35,5 @@ Run from the project root:
 py -m venv ml\ml_venv
 .\ml\ml_venv\Scripts\Activate.ps1
 python -m pip install -r ml\requirements.txt
+python -m ml.trainer
 ```
-
-Use `deactivate` to leave the environment.

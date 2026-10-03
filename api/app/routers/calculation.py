@@ -1,9 +1,11 @@
-from fastapi import APIRouter, UploadFile, File
+import torch
+from fastapi import APIRouter, File, Form, UploadFile
 
-from schemas.calculation_shema import CalculationResponse
-from services.preprocessing import preprocess_image
-from services.prediction import predict_expression
-from services.calculator import calculate_expression
+from api.app.schemas.calculation_schema import CalculationResponse
+from api.app.services.calculator import calculate_expression
+from api.app.services.model_loader import load_model
+from api.app.services.preprocessing import preprocess_image
+from api.app.services.ml import decode_logits
 
 router = APIRouter(
     prefix="/calculate",
@@ -12,16 +14,28 @@ router = APIRouter(
 
 
 @router.post("/", response_model=CalculationResponse)
-async def calculate_from_image(image: UploadFile = File(...)):
-    image_data = await image.read()
+async def calculate_from_image(
+    image: UploadFile = File(...),
+    imageModel: str = Form(...),
+    sequenceModel: str = Form(...),
+):
+    image_tensor = await preprocess_image(image)
 
-    vector = preprocess_image(image_data)
+    model = load_model(
+        imageModel,
+        sequenceModel,
+    )
 
-    expression = predict_expression(vector)
+    with torch.inference_mode():
+        logits = model(image_tensor)
 
-    result = calculate_expression(expression)
+    equation = decode_logits(logits)
+    print("Equation:", repr(equation))
+
+    answer = calculate_expression(equation)
+    print("Answer:", answer)
 
     return CalculationResponse(
-        expression=expression,
-        result=result,
+        equation=equation,
+        answer=answer,
     )

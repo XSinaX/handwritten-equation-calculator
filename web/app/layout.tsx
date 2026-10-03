@@ -4,6 +4,7 @@ import './globals.css';
 import { cn } from '@/lib/utils';
 import Navbar from '@/components/navbar';
 import Footer from '@/components/footer';
+import 'katex/dist/katex.min.css';
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-sans' });
 

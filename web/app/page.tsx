@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -11,23 +11,74 @@ import {
     SelectValue,
 } from '@/components/ui/select';
 import { ImageIcon } from 'lucide-react';
+import { calculateEquation, CalculatorResult } from '@/actions/calculate_action';
+import Image from 'next/image';
+import { BlockMath } from 'react-katex';
 
 export default function Home() {
-    //TODO: get the model options from the backend
     const Image_models = [
-        { label: 'Basic CNN', value: 'basic_cnn' },
+        { label: 'CNN', value: 'cnn' },
         { label: 'ResNet', value: 'resnet' },
         { label: 'Visual Transformer', value: 'visual_transformer' },
     ];
+
     const Sequence_models = [
-        { label: 'LSTM', value: 'lstm' },
+        { label: 'BILSTM', value: 'bilstm' },
         { label: 'GRU', value: 'gru' },
         { label: 'Transformer', value: 'transformer' },
     ];
+
     const [loading, setLoading] = useState(false);
     const [file, setFile] = useState<File | null>(null);
-    const [result, setResult] = useState<unknown>(null);
+    const [result, setResult] = useState<CalculatorResult | null>(null);
     const [error, setError] = useState('');
+
+    const [imageModel, setImageModel] = useState(Image_models[0].value);
+    const [sequenceModel, setSequenceModel] = useState(Sequence_models[0].value);
+
+    const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+    async function handleCalculate() {
+        if (!file) {
+            setError('Please select an image.');
+            return;
+        }
+
+        setLoading(true);
+        setError('');
+
+        try {
+            const formData = new FormData();
+
+            formData.append('image', file);
+            formData.append('imageModel', imageModel);
+            formData.append('sequenceModel', sequenceModel);
+
+            const response = await calculateEquation(formData);
+
+            if (response.status === 'error') {
+                setError(response.error ?? 'Something went wrong.');
+                setResult(null);
+            } else {
+                setResult(response);
+            }
+        } catch (error) {
+            console.error(error);
+
+            setError('Something went wrong while processing the image.');
+            setResult(null);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    useEffect(() => {
+        return () => {
+            if (previewUrl) {
+                URL.revokeObjectURL(previewUrl);
+            }
+        };
+    }, [previewUrl]);
 
     return (
         <div className=" max-w-7xl flex flex-col gap-8 py-4 px-8 w-full mx-auto">
@@ -49,14 +100,30 @@ export default function Home() {
                         className={`relative flex flex-1 min-h-48 flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed border-[#C6C6CD] bg-[#EFF4FF] p-6 text-center
                             ${loading ? 'opacity-50' : ''}`}
                     >
-                        <ImageIcon className="size-8 text-[#0051D5]" aria-hidden="true" />
+                        {previewUrl ? (
+                            <>
+                                <Image
+                                    src={previewUrl}
+                                    alt="Equation preview"
+                                    width={500}
+                                    height={200}
+                                    unoptimized
+                                    className="max-h-40 w-auto object-contain rounded-md"
+                                />
 
-                        <p className="text-lg font-medium text-[#0B1C30]">
-                            {file ? file.name : 'Choose an image or browse'}
-                        </p>
+                                <p className="text-sm font-medium text-[#0B1C30]">{file?.name}</p>
+                            </>
+                        ) : (
+                            <>
+                                <ImageIcon className="size-8 text-[#0051D5]" aria-hidden="true" />
 
-                        <p className="text-sm font-normal text-[#45464D]">PNG or JPG</p>
-                        {/*TODO: complete the file upload functionality */}
+                                <p className="text-lg font-medium text-[#0B1C30]">
+                                    Choose an image or browse
+                                </p>
+
+                                <p className="text-sm font-normal text-[#45464D]">PNG or JPG</p>
+                            </>
+                        )}
                         <Input
                             className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
                             type="file"
@@ -69,6 +136,7 @@ export default function Home() {
                                 setError('');
                                 setResult(null);
                                 setFile(null);
+                                setPreviewUrl(null);
 
                                 if (!selectedFile) return;
 
@@ -78,7 +146,14 @@ export default function Home() {
                                     return;
                                 }
 
+                                if (selectedFile.size > 4 * 1024 * 1024) {
+                                    setError('Please select an image smaller than 4 MB.');
+                                    event.target.value = '';
+                                    return;
+                                }
+
                                 setFile(selectedFile);
+                                setPreviewUrl(URL.createObjectURL(selectedFile));
                             }}
                         />
                     </div>
@@ -91,7 +166,15 @@ export default function Home() {
                             <p className="text-xs text-[#45464D]">
                                 Finds visual patterns in the handwriting.
                             </p>
-                            <Select items={Image_models} defaultValue={Image_models[0].value}>
+                            <Select
+                                items={Image_models}
+                                value={imageModel}
+                                onValueChange={(value) => {
+                                    if (value !== null) {
+                                        setImageModel(value);
+                                    }
+                                }}
+                            >
                                 <SelectTrigger className="w-full">
                                     <SelectValue placeholder="Select a model" />
                                 </SelectTrigger>
@@ -115,7 +198,15 @@ export default function Home() {
                             <p className="text-xs text-[#45464D]">
                                 Reads the detected features in order.
                             </p>
-                            <Select items={Sequence_models} defaultValue={Sequence_models[0].value}>
+                            <Select
+                                items={Sequence_models}
+                                value={sequenceModel}
+                                onValueChange={(value) => {
+                                    if (value !== null) {
+                                        setSequenceModel(value);
+                                    }
+                                }}
+                            >
                                 <SelectTrigger className="w-full">
                                     <SelectValue placeholder="Select a model" />
                                 </SelectTrigger>
@@ -134,8 +225,12 @@ export default function Home() {
                         </div>
                     </div>
 
-                    <Button className="bg-[#0051D5] text-white py-2.5 rounded-md">
-                        Recognize and calculate
+                    <Button
+                        className="bg-[#0051D5] text-white py-2.5 rounded-md"
+                        onClick={handleCalculate}
+                        disabled={loading}
+                    >
+                        {loading ? 'Calculating...' : 'Calculate'}
                     </Button>
                 </div>
                 <div className="flex flex-col gap-5 bg-white p-5 max-w-125">
@@ -175,25 +270,33 @@ export default function Home() {
                 </div>
             </div>
             <div className="flex flex-col gap-5 bg-white p-5">
-                <div>
-                    <h2 className="text-lg font-semibold text-[#002B75]">Result</h2>
-                    <p className="text-xs text-[#45464D]">
-                        Your recognized expression and calculated answer.
-                    </p>
-                </div>
+                <h2 className="text-lg font-semibold text-[#002B75]">Result</h2>
+
                 <hr className="border-t border-[#C6C6CD]" />
-                <div className="flex w-full gap-3 bg-[#EFF4FF] rounded-md">
-                    <div className="flex flex-col gap-1  p-3 flex-1">
-                        <p className="text-xs text-[#0051D5]">Recognized expression</p>
-                        <h3 className="text-lg text-[#0B1C30]">2 + 2 × 3</h3>{' '}
-                        {/*TODO: replace with actual recognized expression */}
+                {!result && !error && (
+                    <p className="text-sm text-[#45464D]">
+                        Your recognized expression and calculated answer will appear here.
+                    </p>
+                )}
+                {error && <p className="text-sm text-red-600">{error}</p>}
+
+                {result && result.status === 'success' && (
+                    <div className="flex w-full gap-3 bg-[#EFF4FF] rounded-md">
+                        <div className="flex flex-col gap-1 p-3 flex-1">
+                            <p className="text-xs text-[#0051D5]">Recognized expression</p>
+
+                            <div className="text-lg text-[#0B1C30]">
+                                <BlockMath math={result.equation ?? ''} />
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col gap-1 p-3 max-w-50">
+                            <p className="text-xs text-[#0051D5]">Calculated answer</p>
+
+                            <h3 className="text-lg text-[#0B1C30]">{result.answer}</h3>
+                        </div>
                     </div>
-                    <div className="flex flex-col gap-1  p-3 max-w[200px]">
-                        <p className="text-xs text-[#0051D5]">Calculated answer</p>
-                        <h3 className="text-lg text-[#0B1C30]">8</h3>{' '}
-                        {/*TODO: replace with actual answer */}
-                    </div>
-                </div>
+                )}
             </div>
         </div>
     );

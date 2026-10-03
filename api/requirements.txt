@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+numpy
+pillow
+python-dotenv
+torch #TODO: if we want to go with diffrent deployment method, remove this

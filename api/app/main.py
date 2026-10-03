@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from routers.calculation import router as calculation_router
+from api.app.routers.calculation import router as calculation_router
 
 app = FastAPI()
 
