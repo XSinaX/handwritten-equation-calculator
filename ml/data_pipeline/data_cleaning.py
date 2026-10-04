@@ -15,8 +15,8 @@ HUMAN_OUTPUT = DATASET_PATH / "human"
 SYNTHETIC_PATH = DATASET_PATH / "synthetic"
 
 
-def is_valid_equation(equation):
-    allowed_commands = ["\\left", "\\right", "\\frac", "\\cdot"]
+def is_valid_equation(equation):  # TODO use config file to store allowed commands and regex patterns for validation
+    allowed_commands = ["\\left", "\\right", "\\div", "\\times"]
 
     commands = re.findall(r"\\[a-zA-Z]+", equation)
 
@@ -34,8 +34,8 @@ def is_valid_equation(equation):
     # Remove allowed characters
     digit_equation = re.sub(r"[+=(){} -]", "", cleaned_equation)
 
-    # Anything remaining must be a digit or decimal point
-    if re.search(r"[^0-9.]", digit_equation):
+    # Anything remaining must be a digit
+    if re.search(r"[^0-9]", digit_equation):
         return False
 
     return True

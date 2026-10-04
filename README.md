@@ -35,5 +35,8 @@ Run from the project root:
 py -m venv ml\ml_venv
 .\ml\ml_venv\Scripts\Activate.ps1
 python -m pip install -r ml\requirements.txt
+
+python -m ml.data_pipeline.equation_generator
+python -m ml.data_pipeline.preprocessing
 python -m ml.trainer
 ```

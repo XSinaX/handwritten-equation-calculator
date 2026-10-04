@@ -1,12 +1,13 @@
 import torch
 from torch import nn
+from shared.config import IMAGE_HEIGHT
 
 
 class BasicCNN(nn.Module):
-    def __init__(self, image_height: int):
+    def __init__(self):
         super().__init__()
 
-        self.expected_height = image_height
+        self.expected_height = IMAGE_HEIGHT
 
         self.features = nn.Sequential(
             nn.Conv2d(
@@ -28,7 +29,7 @@ class BasicCNN(nn.Module):
             nn.MaxPool2d(kernel_size=2),
         )
 
-        self.output_size = 64 * (image_height // 4)
+        self.output_size = 64 * (IMAGE_HEIGHT // 4)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -45,10 +46,7 @@ class BasicCNN(nn.Module):
             raise ValueError("BasicCNN expects grayscale images")
 
         if images.shape[2] != self.expected_height:
-            raise ValueError(
-                f"Expected image height {self.expected_height}, "
-                f"received {images.shape[2]}"
-            )
+            raise ValueError(f"Expected image height {self.expected_height}, " f"received {images.shape[2]}")
 
         features = self.features(images)
 
