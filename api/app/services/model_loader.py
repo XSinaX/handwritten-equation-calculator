@@ -1,11 +1,12 @@
 from pathlib import Path
-
+from functools import lru_cache
 import torch
 from fastapi import HTTPException
 
 MODEL_FOLDER = Path(__file__).resolve().parents[2] / "models"
 
 
+@lru_cache(maxsize=4)
 def load_model(
     image_model: str,
     sequence_model: str,
