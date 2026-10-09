@@ -4,4 +4,5 @@ python-multipart
 numpy
 pillow
 python-dotenv
+opencv-python        
 torch #TODO: if we want to go with diffrent deployment method, remove this
