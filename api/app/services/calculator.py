@@ -28,7 +28,7 @@ def calculate_expression(equation: str) -> float:
     except (SyntaxError, ValueError, TypeError):
         raise HTTPException(
             status_code=400,
-            detail=f"Unable to calculate {equation} due to invalid syntax or unsupported operations.",
+            detail=f"Unable to calculate {equation}. The length of the equation is {len(equation)}.",
         )
 
 

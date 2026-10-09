@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from fastapi import HTTPException, UploadFile
 from PIL import Image
+import cv2
 
 from shared.config import IMAGE_HEIGHT, IMAGE_WIDTH
 
@@ -59,7 +60,21 @@ async def preprocess_image(image: UploadFile) -> torch.Tensor:
         dtype=np.uint8,
     )
 
+    # ------------------
+    image_array = cv2.GaussianBlur(image_array, (3, 3), 0)
+
+    image_array = cv2.adaptiveThreshold(
+        image_array,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        51,
+        15,
+    )
+    # ------------------
     image_array = resize_image(image_array)
+
+    Image.fromarray(image_array).save("debug_preprocessed.png")
 
     # uint8 [0, 255] -> float32 [0, 1]
     image_tensor = torch.from_numpy(image_array.astype(np.float32) / 255.0)
