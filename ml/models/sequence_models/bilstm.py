@@ -5,6 +5,11 @@ from shared.config import NUM_CLASSES
 HIDDEN_SIZE = 128
 NUM_LAYERS = 2
 
+# Dropout between the LSTM layers stopped CTC training from ever getting
+# started (loss stuck at ~3.0, empty predictions for 10+ epochs). Image
+# augmentation already guards against overfitting, so it is off.
+DROPOUT = 0.0
+
 
 class BiLSTM(nn.Module):
     def __init__(
@@ -17,7 +22,7 @@ class BiLSTM(nn.Module):
             input_size=input_size,
             hidden_size=HIDDEN_SIZE,
             num_layers=NUM_LAYERS,
-            dropout=0.2,
+            dropout=DROPOUT,
             bidirectional=True,
             batch_first=True,
         )

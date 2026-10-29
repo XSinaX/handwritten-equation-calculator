@@ -1,5 +1,5 @@
 import torch
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from api.app.schemas.calculation_schema import CalculationResponse
 from api.app.services.calculator import calculate_expression
@@ -32,7 +32,17 @@ async def calculate_from_image(
     equation = decode_logits(logits)
     print("Equation:", repr(equation))
 
-    answer = calculate_expression(equation)
+    try:
+        answer = calculate_expression(equation)
+    except HTTPException as error:
+        # Keep the error message the website shows, but also say what was
+        # recognised so testing tools can score it (e.g. "5\div0")
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.detail,
+            headers={"X-Recognized-Equation": equation},
+        )
+
     print("Answer:", answer)
 
     return CalculationResponse(

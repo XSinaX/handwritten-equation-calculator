@@ -6,3 +6,4 @@ pillow
 python-dotenv
 opencv-python        
 torch #TODO: if we want to go with diffrent deployment method, remove this
+httpx  # only needed for api/tests (in-process API testing)

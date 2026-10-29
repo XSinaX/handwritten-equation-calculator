@@ -1,88 +1,28 @@
-from io import BytesIO
+import os
 
 import numpy as np
 import torch
 from fastapi import HTTPException, UploadFile
 from PIL import Image
-import cv2
 
-from shared.config import IMAGE_HEIGHT, IMAGE_WIDTH
-
-
-def resize_image(image: np.ndarray) -> np.ndarray:
-    target_h = IMAGE_HEIGHT
-    target_w = IMAGE_WIDTH
-
-    pil_image = Image.fromarray(image.astype(np.uint8))
-
-    original_w, original_h = pil_image.size
-
-    scale = min(
-        target_w / original_w,
-        target_h / original_h,
-    )
-
-    new_w = round(original_w * scale)
-    new_h = round(original_h * scale)
-
-    if new_w == 0 or new_h == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Image aspect ratio is too extreme to preprocess.",
-        )
-
-    resized = pil_image.resize(
-        (new_w, new_h),
-        Image.Resampling.LANCZOS,
-    )
-
-    canvas = Image.new(
-        mode="L",
-        size=(target_w, target_h),
-        color=255,
-    )
-
-    left = (target_w - new_w) // 2
-    top = (target_h - new_h) // 2
-
-    canvas.paste(resized, (left, top))
-
-    return np.asarray(canvas, dtype=np.uint8)
+from shared.image_preprocessing import PreprocessingError, preprocess_bytes
 
 
 async def preprocess_image(image: UploadFile) -> torch.Tensor:
+    """Uploaded image -> model input tensor [1, 1, 128, 512] (see shared/image_preprocessing.py)."""
+
     contents = await image.read()
 
-    pil_image = Image.open(BytesIO(contents)).convert("L")
+    try:
+        image_array = preprocess_bytes(contents)
+    except PreprocessingError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
-    image_array = np.asarray(
-        pil_image,
-        dtype=np.uint8,
-    )
+    # Set SAVE_PREPROCESSED_IMAGE=1 to see exactly what the model receives
+    if os.environ.get("SAVE_PREPROCESSED_IMAGE"):
+        Image.fromarray(image_array).save("debug_preprocessed.png")
 
-    # ------------------
-    image_array = cv2.GaussianBlur(image_array, (3, 3), 0)
-
-    image_array = cv2.adaptiveThreshold(
-        image_array,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        51,
-        15,
-    )
-    # ------------------
-    image_array = resize_image(image_array)
-
-    Image.fromarray(image_array).save("debug_preprocessed.png")
-
-    # uint8 [0, 255] -> float32 [0, 1]
+    # uint8 [0, 255] -> float32 [0, 1], shaped [batch, channel, height, width]
     image_tensor = torch.from_numpy(image_array.astype(np.float32) / 255.0)
 
-    # [H, W] -> [1, H, W]
-    image_tensor = image_tensor.unsqueeze(0)
-
-    # [1, H, W] -> [1, 1, H, W]
-    image_tensor = image_tensor.unsqueeze(0)
-
-    return image_tensor
+    return image_tensor.unsqueeze(0).unsqueeze(0)

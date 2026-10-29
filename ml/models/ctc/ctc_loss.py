@@ -50,6 +50,14 @@ class EquationCTCLoss(nn.Module):
             dtype=torch.long,
         )
 
+        # On AMD (ROCm) GPUs, CTC loss is very slow the first time it sees each
+        # new label length (~360 ms per batch vs <1 ms on the CPU). The tensor
+        # is tiny, so compute the loss on the CPU; gradients still flow back
+        # to the GPU model as normal.
+        if torch.version.hip is not None and log_probs.is_cuda:
+            log_probs = log_probs.cpu()
+            targets = targets.cpu()
+
         return self.loss_function(
             log_probs,
             targets,

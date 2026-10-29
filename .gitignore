@@ -9,6 +9,12 @@
 /api/**/__pycache__/
 /api/**/*.py[cod]
 
+# Generated test photos and results (re-create with api/tests/make_photo_test_set.py)
+/api/tests/photos*/
+
+# Written only when SAVE_PREPROCESSED_IMAGE is set
+debug_preprocessed.png
+
 
 # ==================================================
 # ML

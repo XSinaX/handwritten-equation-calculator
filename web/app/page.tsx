@@ -19,7 +19,7 @@ export default function Home() {
     const Image_models = [
         { label: 'CNN', value: 'cnn' },
         { label: 'ResNet', value: 'resnet' },
-        { label: 'Visual Transformer', value: 'visual_transformer' },
+        { label: 'Visual Transformer', value: 'vision_transformer' },
     ];
 
     const Sequence_models = [

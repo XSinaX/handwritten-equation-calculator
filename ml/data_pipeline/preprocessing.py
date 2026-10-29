@@ -5,15 +5,19 @@ import csv
 from PIL import Image, ImageDraw
 import random
 
-import matplotlib.pyplot as plt
-
 from shared.config import IMAGE_HEIGHT, IMAGE_WIDTH
 
-MIN_LINE_WIDTH = 8
-MAX_LINE_WIDTH = 14
+# Wider range than before (8-14) so the model sees thin and thick pens
+MIN_LINE_WIDTH = 5
+MAX_LINE_WIDTH = 22
+DEFAULT_LINE_WIDTH = 10
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-INK_FOLDER = PROJECT_ROOT / "ml" / "data" / "generated"
+GENERATED_FOLDER = PROJECT_ROOT / "ml" / "data" / "generated"
+SPLITS = ["train", "val", "test"]
+
+HUMAN_INK_FOLDER = PROJECT_ROOT / "ml" / "data" / "mathwriting-2024" / "human"
+HUMAN_OUTPUT_FOLDER = PROJECT_ROOT / "ml" / "data" / "human_test"
 
 
 def render_ink(file_path, padding=20, line_width=10):
@@ -230,11 +234,12 @@ def resize_image(
     return np.asarray(canvas, dtype=np.uint8)
 
 
-def preprocess_ink(path):
-    line_width = random.randint(
-        MIN_LINE_WIDTH,
-        MAX_LINE_WIDTH,
-    )
+def preprocess_ink(path, line_width=None):
+    if line_width is None:
+        line_width = random.randint(
+            MIN_LINE_WIDTH,
+            MAX_LINE_WIDTH,
+        )
     image, target, log = render_ink(path, line_width=line_width)
 
     # Rendering failed completely
@@ -246,129 +251,104 @@ def preprocess_ink(path):
     return image.astype(np.uint8), target, log
 
 
-ink_files = sorted(INK_FOLDER.glob("*.inkml"))
+def build_dataset(ink_folder, output_folder, random_line_width=True):
+    """
+    Renders every InkML file in ink_folder and saves X.npy, y.npy and
+    log.csv to output_folder.
+    """
 
-if not ink_files:
-    print(f"No InkML files found in {INK_FOLDER}.")
-    exit(1)
+    ink_files = sorted(ink_folder.glob("*.inkml"))
 
-processed = []
-targets = []
-log_rows = []
+    if not ink_files:
+        print(f"No InkML files found in {ink_folder}. Skipping.")
+        return
 
-for path in ink_files:
-    try:
-        image, target, log = preprocess_ink(path)
+    processed = []
+    targets = []
+    log_rows = []
 
-        # Only save the image if it was successfully processed
-        if image is not None and log == "OK":
-            processed.append(image)
-            targets.append(target)
+    for path in ink_files:
+        try:
+            if random_line_width:
+                image, target, log = preprocess_ink(path)
+            else:
+                image, target, log = preprocess_ink(path, line_width=DEFAULT_LINE_WIDTH)
 
-        # Record files that actually had an issue
-        if log != "OK":
+            # Only save the image if it was successfully processed
+            if image is not None and log == "OK":
+                processed.append(image)
+                targets.append(target)
+
+            # Record files that actually had an issue
+            if log != "OK":
+                log_rows.append(
+                    {
+                        "filename": path.name,
+                        "message": log,
+                    }
+                )
+
+        except Exception as error:
             log_rows.append(
                 {
                     "filename": path.name,
-                    "message": log,
+                    "message": f"Preprocessing failed: {error}",
                 }
             )
 
-    except Exception as error:
-        log_rows.append(
-            {
-                "filename": path.name,
-                "message": f"Preprocessing failed: {error}",
-            }
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # Save processed images
+    X = np.stack(processed)
+    np.save(output_folder / "X.npy", X)
+
+    # Save corresponding target labels
+    y = np.array(targets)
+    np.save(output_folder / "y.npy", y)
+
+    # Save preprocessing log
+    log_path = output_folder / "log.csv"
+
+    with open(log_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["filename", "message"],
         )
 
-# -------------------------
-# Visualize a few processed images for sanity check
-# -------------------------
-# if processed:
+        writer.writeheader()
+        writer.writerows(log_rows)
 
-#     GRID_ROWS = 3
-#     GRID_COLUMNS = 3
-#     NUM_WINDOWS = 5
+    print(f"\n[{ink_folder.name}]")
+    print(f"Files found: {len(ink_files)}")
+    print(f"Successfully processed: {len(processed)}")
+    print(f"Dataset shape: {X.shape}")
+    print(f"Saved to: {output_folder / 'X.npy'}")
 
-#     samples_per_window = GRID_ROWS * GRID_COLUMNS
-#     num_samples = min(
-#         samples_per_window * NUM_WINDOWS,
-#         len(processed),
-#     )
-
-#     for start_index in range(
-#         0,
-#         num_samples,
-#         samples_per_window,
-#     ):
-
-#         fig, axes = plt.subplots(
-#             GRID_ROWS,
-#             GRID_COLUMNS,
-#             figsize=(10, 10),
-#         )
-
-#         axes = axes.flatten()
-
-#         for grid_index, axis in enumerate(axes):
-
-#             sample_index = start_index + grid_index
-
-#             # Hide unused cells in the final window
-#             if sample_index >= num_samples:
-#                 axis.axis("off")
-#                 continue
-
-#             axis.imshow(
-#                 processed[sample_index],
-#                 cmap="gray",
-#                 vmin=0,
-#                 vmax=255,
-#             )
-
-#             axis.set_title(
-#                 f"Target: {targets[sample_index]}",
-#                 fontsize=9,
-#             )
-
-#             axis.axis("off")
-
-#         fig.suptitle(
-#             f"Samples {start_index + 1}-" f"{min(start_index + samples_per_window, num_samples)}",
-#             fontsize=14,
-#         )
-
-#         plt.tight_layout()
-#         plt.show()
+    if log_rows:
+        print(f"WARNING: {len(log_rows)} file(s) had preprocessing issues. " f"See {log_path}")
 
 
-# Save processed images
-X = np.stack(processed)
-np.save(INK_FOLDER / "X.npy", X)
+def main():
+    for split in SPLITS:
+        build_dataset(
+            GENERATED_FOLDER / split,
+            GENERATED_FOLDER / split,
+        )
 
-# Save corresponding target labels
-y = np.array(targets)
-np.save(INK_FOLDER / "y.npy", y)
+    # Real handwritten equations (produced by data_cleaning.py).
+    # The model never trains on these, so they are the honest
+    # "unseen data" score.
+    if HUMAN_INK_FOLDER.exists():
+        build_dataset(
+            HUMAN_INK_FOLDER,
+            HUMAN_OUTPUT_FOLDER,
+        )
+    else:
+        print(
+            f"\nNo human handwriting found at {HUMAN_INK_FOLDER}. "
+            "Run `python -m ml.data_pipeline.data_cleaning` to create a real-handwriting test set."
+        )
 
 
-# Save preprocessing log
-log_path = INK_FOLDER / "log.csv"
-
-with open(log_path, "w", newline="", encoding="utf-8") as file:
-    writer = csv.DictWriter(
-        file,
-        fieldnames=["filename", "message"],
-    )
-
-    writer.writeheader()
-    writer.writerows(log_rows)
-
-
-print(f"Files found: {len(ink_files)}")
-print(f"Successfully processed: {len(processed)}")
-print(f"Dataset shape: {X.shape}")
-print(f"Saved to: {INK_FOLDER / 'X.npy'}")
-
-if log_rows:
-    print(f"WARNING: {len(log_rows)} file(s) had preprocessing issues. " f"See {log_path}")
+if __name__ == "__main__":
+    main()
