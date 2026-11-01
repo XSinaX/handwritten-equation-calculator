@@ -1,105 +1,31 @@
-# ==================================================
-# API
-# ==================================================
 
-# Virtual environment
-/api/api_venv/
+# Python
+__pycache__/
+*.py[cod]
+api_venv/
+ml_venv/
 
-# Python-generated files
-/api/**/__pycache__/
-/api/**/*.py[cod]
-
-# Generated test photos and results (re-create with api/tests/make_photo_test_set.py)
-/api/tests/photos*/
-
-# Written only when SAVE_PREPROCESSED_IMAGE is set
-debug_preprocessed.png
-
-
-# ==================================================
-# ML
-# ==================================================
-
-# Virtual environments 
-/ml/ml_venv/
-/ml/**/.venv/
-/ml/**/venv/
-
-# Python-generated files
-/ml/**/__pycache__/
-/ml/**/*.py[cod]
-
-# Processed / generated image outputs 
-/ml/**/data_processed/
-/ml/**/dataset_processed/
-/ml/**/*_processed/
-/ml/**/*_output/
-
-# Raw dataset (large — reference via README/download link instead of committing)
-/ml/**/data/
-/ml/**/dataset/
-
-# Jupyter
-/ml/**/.ipynb_checkpoints/
-
-
-# ==================================================
-# WEB
-# ==================================================
-
-# Dependencies
-/web/node_modules/
-/web/.pnp
-/web/.pnp.*
-/web/.yarn/*
-!/web/.yarn/patches
-!/web/.yarn/plugins
-!/web/.yarn/releases
-!/web/.yarn/versions
-
-# Testing
-/web/coverage/
+# ML Data
+/ml/datasets/
 
 # Next.js
-/web/.next/
-/web/out/
+node_modules/
+.next/
+out/
+build/
+coverage/
+.vercel/
+next-env.d.ts
+*.tsbuildinfo
 
-# Production
-/web/build/
+# Environment & Secrets
+.env*
+!.env.example
+*.key
+*.pem
 
-# Miscellaneous
-/web/**/.DS_Store
-/web/**/*.pem
-
-# Debug
-/web/npm-debug.log*
-/web/yarn-debug.log*
-/web/yarn-error.log*
-/web/.pnpm-debug.log*
-
-# Vercel
-/web/.vercel/
-
-# TypeScript
-/web/*.tsbuildinfo
-/web/next-env.d.ts
-
-
-# ==================================================
-# GENERAL
-# ==================================================
-
-# Shared environment file
-/.env
-
-# Operating-system files
+# System
 .DS_Store
 Thumbs.db
-
-# IDE settings
-/.idea/
-/.vscode/
-
-# API keys / secrets
-API KEY
-*.key
+.idea/
+.vscode/
