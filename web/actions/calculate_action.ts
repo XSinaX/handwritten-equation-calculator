@@ -9,8 +9,8 @@ export type CalculatorResult = {
 
 export async function calculateEquation(formData: FormData): Promise<CalculatorResult> {
     const image = formData.get('image');
-    const imageModel = formData.get('imageModel');
-    const sequenceModel = formData.get('sequenceModel');
+    const architecture = formData.get('architecture');
+    const model = formData.get('model');
 
     if (!(image instanceof File)) {
         return {
@@ -19,31 +19,42 @@ export async function calculateEquation(formData: FormData): Promise<CalculatorR
         };
     }
 
-    if (typeof imageModel !== 'string' || typeof sequenceModel !== 'string') {
+    if (architecture !== 'end_to_end' && architecture !== 'segmentation') {
         return {
             status: 'error',
-            error: 'Please select both models.',
+            error: 'Invalid recognition architecture.',
+        };
+    }
+
+    if (typeof model !== 'string' || !model.trim()) {
+        return {
+            status: 'error',
+            error: 'Please select a model.',
         };
     }
 
     const backendFormData = new FormData();
 
     backendFormData.append('image', image);
-    backendFormData.append('imageModel', imageModel);
-    backendFormData.append('sequenceModel', sequenceModel);
+    backendFormData.append('architecture', architecture);
+    backendFormData.append('model', model);
 
     try {
-        const response = await fetch(`${process.env.BACKEND_URL}/calculate/`, {
+        const response = await fetch(`${process.env.BACKEND_URL}/calculate`, {
             method: 'POST',
             body: backendFormData,
             cache: 'no-store',
         });
 
         if (!response.ok) {
-            const errorData = await response.json();
+            const errorData = await response.json().catch(() => null);
+
             return {
                 status: 'error',
-                error: errorData.detail ?? 'Failed to process the image.',
+                error:
+                    typeof errorData?.detail === 'string'
+                        ? errorData.detail
+                        : 'Failed to process the image.',
             };
         }
 

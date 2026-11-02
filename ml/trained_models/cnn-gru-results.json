@@ -1,0 +1,12 @@
+{
+  "model": "cnn-gru",
+  "image_height": 128,
+  "image_width": 1024,
+  "best_epoch": 19,
+  "epochs_trained": 29,
+  "best_validation_sequence_accuracy": 0.8046975546975547,
+  "best_validation_loss": 0.08318385444377745,
+  "test_samples": 3180,
+  "test_sequence_accuracy": 0.7867924528301887,
+  "test_token_error_rate": 0.021992176319053525
+}

@@ -1,7 +1,7 @@
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from shared.config import TOKENS, BLANK_TOKEN
+from ml.config import TOKENS, BLANK_TOKEN
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 

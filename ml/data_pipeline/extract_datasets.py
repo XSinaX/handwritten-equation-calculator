@@ -1,21 +1,3 @@
-"""Extract equation PNGs and CROHME symbol InkML from original archives.
-
-Inputs (never modified):
-    ml/datasets/original/CROHME23.zip
-    ml/datasets/original/mathwriting-2024.tgz
-
-Outputs:
-    ml/datasets/equation/{train,validation,test}/{dataset}/*.png
-    ml/datasets/equation/{train,validation,test}/{dataset}/labels.csv
-    ml/datasets/symbol/{train,validation,test}/CROHME23/InkML/*.inkml
-
-Equation labels are saved in both PNG metadata ("equation") and each dataset's
-labels.csv. Symbol labels are stored in their InkML annotations (type="label").
-
-Run from the repository root:
-    python -m ml.data_pipeline.extract_datasets
-"""
-
 from __future__ import annotations
 
 import csv
@@ -30,7 +12,7 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image, ImageDraw, PngImagePlugin
 
-from shared.config import BLANK_TOKEN, IMAGE_HEIGHT, TOKENS
+from ml.config import BLANK_TOKEN, IMAGE_HEIGHT, SYMBOL_WIDTH, TOKENS
 
 # ============================== Configuration ==============================
 
@@ -180,7 +162,10 @@ def read_traces(root: ET.Element) -> dict[str, list[tuple[float, float, float]]]
     return traces
 
 
-def render_inkml(traces: dict[str, list[tuple[float, float, float]]]) -> Image.Image:
+def render_inkml(
+    traces: dict[str, list[tuple[float, float, float]]],
+    target_width: int | None = None,
+) -> Image.Image:
     """Render MathWriting strokes at IMAGE_HEIGHT, preserving aspect ratio.
 
     Small point-like traces are filled circles, preserving division dots.
@@ -193,12 +178,24 @@ def render_inkml(traces: dict[str, list[tuple[float, float, float]]]) -> Image.I
 
     content_width = max_x - min_x
     content_height = max_y - min_y
+
     scale = (IMAGE_HEIGHT - 2 * PADDING - LINE_WIDTH) / max(content_height, 1.0)
-    width = max(2 * PADDING + 1, math.ceil(content_width * scale) + 2 * PADDING + LINE_WIDTH)
+
+    if target_width is not None:
+        scale = min(
+            scale,
+            (target_width - 2 * PADDING - LINE_WIDTH) / max(content_width, 1.0),
+        )
+
+    width = (
+        target_width
+        if target_width is not None
+        else max(2 * PADDING + 1, math.ceil(content_width * scale) + 2 * PADDING + LINE_WIDTH)
+    )
 
     image = Image.new("L", (width, IMAGE_HEIGHT), 255)
     canvas = ImageDraw.Draw(image)
-    offset_x = PADDING + LINE_WIDTH / 2
+    offset_x = (width - content_width * scale) / 2 if target_width is not None else PADDING + LINE_WIDTH / 2
     offset_y = (IMAGE_HEIGHT - content_height * scale) / 2
 
     for trace in traces.values():
@@ -279,6 +276,46 @@ def save_symbol(
 
     output = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     (folder / f"{filename}.inkml").write_bytes(output)
+    # Render the same symbol as a fixed-size PNG.
+    png_folder = DATASETS / "symbol" / split / "CROHME23" / "PNG"
+    png_folder.mkdir(parents=True, exist_ok=True)
+
+    symbol_traces = {str(index): trace for index, trace in enumerate(strokes)}
+
+    image = render_inkml(symbol_traces, target_width=SYMBOL_WIDTH)
+
+    metadata = PngImagePlugin.PngInfo()
+    metadata.add_text("label", label)
+
+    image.save(png_folder / f"{filename}.png", pnginfo=metadata)
+
+
+def write_symbol_labels() -> None:
+    """Write a labels.csv for each CROHME symbol PNG split."""
+    for split in CROHME_SPLITS:
+        folder = DATASETS / "symbol" / split / "CROHME23" / "PNG"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        records = []
+
+        for image_path in sorted(folder.glob("*.png")):
+            with Image.open(image_path) as image:
+                label = image.info.get("label", "")
+
+            if label:
+                records.append(
+                    {
+                        "image": image_path.name,
+                        "label": label,
+                    }
+                )
+
+        with (folder / "labels.csv").open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=("image", "label"))
+            writer.writeheader()
+            writer.writerows(records)
+
+        print(f"Symbol {split}: {len(records):,} PNGs")
 
 
 # ================================= Equations =================================
@@ -438,6 +475,7 @@ def extract_crohme() -> None:
                 pass
 
     write_equation_labels("CROHME23", records)
+    write_symbol_labels()
 
 
 def extract_mathwriting() -> None:

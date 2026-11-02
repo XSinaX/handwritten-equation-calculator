@@ -16,12 +16,6 @@ export default function Navbar() {
                     >
                         Calculator
                     </Link>
-                    <Link
-                        href="/performance"
-                        className="inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-semibold hover:bg-[#DCE9FF] hover:text-[#0051D5]"
-                    >
-                        Model Performance
-                    </Link>
                 </div>
             </div>
         </nav>

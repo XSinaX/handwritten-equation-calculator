@@ -124,23 +124,24 @@ equations that follow these rules (`shared/constrained_decoding.py`).
 1. Put your photos (JPG/PNG) in a folder, e.g. `my_photos/`.
 2. Add `my_photos/labels.csv`:
 
-   ```
-   filename,equation
-   photo1.jpg,12+3=
-   photo2.jpg,5x-2
-   photo3.jpg,(3+4)*2
-   photo4.jpg,8/2
-   ```
+    ```
+    filename,equation
+    photo1.jpg,12+3=
+    photo2.jpg,5x-2
+    photo3.jpg,(3+4)*2
+    photo4.jpg,8/2
+    ```
 
-   Type equations naturally: `x` or `*` for times, `/` for divide, spaces are ignored.
+    Type equations naturally: `x` or `*` for times, `/` for divide, spaces are ignored.
+
 3. Run from the project root:
 
-   ```powershell
-   python -m api.tests.evaluate_api --images my_photos
-   python -m api.tests.evaluate_api --images my_photos --url http://localhost:8000   # against a running API
-   ```
+    ```powershell
+    python -m api.tests.evaluate_api --images my_photos
+    python -m api.tests.evaluate_api --images my_photos --url http://localhost:8000   # against a running API
+    ```
 
-   Results for each image are saved to `my_photos/results.csv`.
+    Results for each image are saved to `my_photos/results.csv`.
 
 To build a photo-like test set from real handwriting (paper texture, uneven lighting,
 ruled lines, ink colours, slight rotation/perspective, blur, JPEG compression):
@@ -150,3 +151,4 @@ python -m api.tests.make_photo_test_set --splits valid test
 python -m api.tests.evaluate_api --images api/tests/photos
 ```
 
+python -m ml.preprocessing.preprocess_image

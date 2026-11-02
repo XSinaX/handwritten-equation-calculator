@@ -1,24 +1,50 @@
+from __future__ import annotations
+
 import argparse
-import os
-import time
+import csv
+import json
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, Dataset, DataLoader
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
 
-from ml.models.equation_recognition_model import EquationRecognitionModel
-from ml.models.ctc.tokenizer import CTCTokenizer
-from ml.models.ctc.ctc_loss import EquationCTCLoss
-from ml.models.evaluation.evaluation import evaluate_batch
-from ml.data_pipeline.augmentation import augment_image
-from ml.evaluate import report_on_held_out_sets
+from ml.end_to_end.ctc.ctc_loss import EquationCTCLoss
+from ml.end_to_end.ctc.decoder import greedy_decode
+from ml.end_to_end.ctc.tokenizer import CTCTokenizer
+from ml.end_to_end.equation_recognition_model import EquationRecognitionModel
+from ml.end_to_end.evaluation.evaluation import edit_distance
 
-IMAGE_MODEL = "cnn"
-SEQUENCE_MODEL = "bilstm"
 
-IMAGE_MODEL_CHOICES = ["cnn", "resnet", "vision_transformer"]
-SEQUENCE_MODEL_CHOICES = ["bilstm", "gru", "transformer"]
+from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH, SYMBOL_WIDTH, TOKENS, BLANK_TOKEN
+from ml.segmentation_based.models import create_model as create_symbol_model
+from ml.preprocessing import preprocess_symbol_image
+from ml.segmentation_based.segmentation import SEGMENTATION_METHODS
+
+MODEL_PAIRS = {
+    "cnn-gru": ("cnn", "gru"),
+    "resnet-bilstm": ("resnet", "bilstm"),
+    "vit-transformer": ("vision_transformer", "transformer"),
+}
+SEGMENTATION_PAIRS = {
+    f"seg-{method}-{classifier}": (method, classifier)
+    for method in ("cca", "vp", "aug")
+    for classifier in ("cnn", "resnet")
+}
+SEGMENTATION_NAMES = {
+    "cca": "cca",
+    "vp": "vertical_projection",
+    "aug": "augmented_CCL",
+}
+MODEL_CHOICES = {**MODEL_PAIRS, **SEGMENTATION_PAIRS}
+DEFAULT_MODEL = "cnn-gru"
+
+IMAGE_MODEL, SEQUENCE_MODEL = MODEL_PAIRS[DEFAULT_MODEL]
+IMAGE_MODEL_CHOICES = [pair[0] for pair in MODEL_PAIRS.values()]
+SEQUENCE_MODEL_CHOICES = [pair[1] for pair in MODEL_PAIRS.values()]
 
 BATCH_SIZE = 32
 EPOCHS = 100
@@ -26,322 +52,187 @@ LEARNING_RATE = 0.001
 RANDOM_SEED = 42
 EARLY_STOPPING_PATIENCE = 10
 EARLY_STOPPING_MIN_DELTA = 0.001
-
-# Stabilisers: cap the size of each update, and halve the learning rate when
-# validation loss hasn't improved for a couple of epochs.
 GRADIENT_CLIP_NORM = 5.0
 LR_REDUCE_FACTOR = 0.5
 LR_REDUCE_PATIENCE = 2
 MIN_LEARNING_RATE = 1e-5
-
-# Background processes that prepare (and augment) batches while the GPU trains
-NUM_WORKERS = min(4, os.cpu_count() or 1)
+NUM_WORKERS = 0
 
 ML_ROOT = Path(__file__).resolve().parent
-DATA_FOLDER = ML_ROOT / "data" / "generated"
-
-# Train and validation are built from different symbol drawings
-# (see equation_generator.py), so validation measures unseen handwriting.
-TRAIN_FOLDER = DATA_FOLDER / "train"
-VALIDATION_FOLDER = DATA_FOLDER / "val"
-
-# Extra training data, each used when present (validation stays on the
-# ink-built set):
-#   image_generated - equations built from image datasets (image_symbols.py)
-#   photo_generated - equations as the API sees them after a photo (photo_style.py)
-EXTRA_TRAIN_FOLDERS = [
-    ML_ROOT / "data" / "image_generated" / "train",
-    ML_ROOT / "data" / "photo_generated" / "train",
-]
+DATASETS_ROOT = ML_ROOT / "datasets" / "equation"
+MODEL_FOLDER = ML_ROOT / "trained_models"
+SYMBOL_DATA_ROOT = ML_ROOT / "datasets" / "symbol"
+SYMBOL_TOKENS = tuple(token for token in TOKENS if token != BLANK_TOKEN)
+SYMBOL_BATCH_SIZE = 128
+RESULTS_FILE = MODEL_FOLDER / "results.json"
+PREDICTIONS_FILE = MODEL_FOLDER / "test_predictions.csv"
+SYMBOL_WEIGHT_DECAY = 1e-4
 
 
 class EquationDataset(Dataset):
-    def __init__(self, folder, augment=False):
-        self.x_path = folder / "X.npy"
-        self.y = np.load(folder / "y.npy", allow_pickle=True)
-        self.augment = augment
+    """Read preprocessed fixed-size images and raw equation labels from one split."""
 
-        # Images are opened lazily (memory-mapped) so each DataLoader worker
-        # reads from disk instead of receiving its own copy of the whole array.
-        self.X = None
+    def __init__(self, split: str):
+        path = DATASETS_ROOT / split / "preprocessed.npz"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {split} dataset: {path}\n" "Run python -m ml.preprocess_image first.")
 
-    def __len__(self):
-        return len(self.y)
+        with np.load(path, allow_pickle=False) as archive:
+            self.images = archive["images"]
+            self.equations = archive["equations"]
+            self.sources = (
+                archive["sources"]
+                if "sources" in archive.files
+                else np.asarray([f"{split}/{index}.png" for index in range(len(self.equations))], dtype=str)
+            )
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["X"] = None
-        return state
+        if self.images.ndim != 3 or len(self.images) != len(self.equations) or len(self.sources) != len(self.images):
+            raise ValueError(f"Invalid images/equations arrays in {path}")
+        if len(self.images) == 0:
+            raise ValueError(f"Empty {split} dataset: {path}")
+        if self.images.dtype != np.uint8:
+            raise ValueError(f"Expected uint8 images in {path}, got {self.images.dtype}")
 
-    def __getitem__(self, index):
-        if self.X is None:
-            self.X = np.load(self.x_path, mmap_mode="r")
+    def __len__(self) -> int:
+        return len(self.images)
 
-        image = np.array(self.X[index])
-        label = self.y[index]
-
-        if self.augment:
-            image = augment_image(image)
-
-        # uint8 [0, 255] -> float32 [0, 1]
-        image = image.astype(np.float32) / 255.0
-
-        image = torch.from_numpy(image)
-
-        # Add grayscale channel:
-        # [128, 128] -> [1, 128, 128]
-        image = image.unsqueeze(0)
-
-        return image, label
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, str]:
+        # [H, W] uint8 -> [1, H, W] float32, with white=1 and black=0.
+        image = torch.from_numpy(self.images[index].astype(np.float32) / 255.0)
+        return image.unsqueeze(0), str(self.equations[index])
 
 
-def train_one_epoch(
-    model,
-    dataloader,
-    tokenizer,
-    criterion,
-    optimizer,
-    device,
-):
+def sequence_accuracy(logits: torch.Tensor, labels, tokenizer: CTCTokenizer) -> int:
+    """Count exact-match equations after CTC greedy decoding."""
+    predictions = greedy_decode(logits.detach(), tokenizer)
+    return sum(predicted == tokenizer.decode(tokenizer.encode(label)) for predicted, label in zip(predictions, labels))
+
+
+def train_one_epoch(model, loader, tokenizer, criterion, optimizer, device) -> float:
+    """Return online sequence accuracy across the training batches."""
     model.train()
+    correct, total = 0, 0
 
-    total_loss = 0
-
-    for images, labels in dataloader:
-
-        images = images.to(device)
-
-        # Convert target equations into CTC token IDs
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
         targets, target_lengths = tokenizer.encode_batch(labels)
-
         targets = targets.to(device)
 
-        # Forward pass
-        logits = model(images)
-
-        loss = criterion(
-            logits,
-            targets,
-            target_lengths,
-        )
-
         optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, targets, target_lengths)
+
+        # Reuse this forward pass to report training accuracy without an extra
+        # whole-dataset evaluation; this is an online, train-mode measurement.
+        with torch.no_grad():
+            correct += sequence_accuracy(logits, labels, tokenizer)
+            total += len(labels)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
         optimizer.step()
 
-        total_loss += loss.item()
-
-    average_loss = total_loss / len(dataloader)
-    return average_loss
+    return correct / total
 
 
-def validate(
+@torch.no_grad()
+def evaluate(
     model,
-    dataloader,
+    loader,
     tokenizer,
     criterion,
     device,
-):
+    with_loss: bool,
+    with_token_error: bool = False,
+    collect_predictions: bool = False,
+) -> tuple[float, float | None, float | None, list[str]]:
+    """Return exact-sequence accuracy, optional CTC loss, and optional token error rate."""
     model.eval()
+    correct, total = 0, 0
+    loss_sum = 0.0
+    token_errors, target_tokens = 0, 0
+    all_predictions = []
 
-    total_loss = 0
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        logits = model(images)
+        predictions = greedy_decode(logits, tokenizer)
+        if collect_predictions:
+            all_predictions.extend(predictions)
+        for prediction, label in zip(predictions, labels):
+            target_ids = tokenizer.encode(label)
+            correct += prediction == tokenizer.decode(target_ids)
+            if with_token_error:
+                predicted_ids = tokenizer.encode(prediction)
+                token_errors += edit_distance(predicted_ids, target_ids)
+                target_tokens += len(target_ids)
+        total += len(labels)
 
-    correct_sequences = 0
-    total_sequences = 0
-
-    total_token_errors = 0
-    total_target_tokens = 0
-
-    with torch.no_grad():
-
-        for images, labels in dataloader:
-
-            images = images.to(device)
-
+        if with_loss:
             targets, target_lengths = tokenizer.encode_batch(labels)
-
-            targets = targets.to(device)
-
-            logits = model(images)
-
-            loss = criterion(
-                logits,
-                targets,
-                target_lengths,
-            )
-
-            total_loss += loss.item()
-
-            (
-                batch_correct_sequences,
-                batch_total_sequences,
-                batch_token_errors,
-                batch_target_tokens,
-            ) = evaluate_batch(
-                logits,
-                labels,
-                tokenizer,
-            )
-
-            correct_sequences += batch_correct_sequences
-
-            total_sequences += batch_total_sequences
-
-            total_token_errors += batch_token_errors
-
-            total_target_tokens += batch_target_tokens
-
-    average_loss = total_loss / len(dataloader)
-
-    sequence_accuracy = correct_sequences / total_sequences
-
-    token_error_rate = total_token_errors / total_target_tokens
+            loss = criterion(logits, targets.to(device), target_lengths)
+            loss_sum += loss.item() * len(labels)
 
     return (
-        average_loss,
-        sequence_accuracy,
-        token_error_rate,
+        correct / total,
+        loss_sum / total if with_loss else None,
+        token_errors / target_tokens if with_token_error and target_tokens else None,
+        all_predictions,
     )
 
 
-def choose_device(gpu_index=None):
-    """
-    Picks the GPU with the most compute units, so a dedicated graphics card
-    wins over the small GPU built into the processor. (Memory size can't be
-    used: a built-in GPU reports shared system RAM, which often looks bigger.)
-    NVIDIA (CUDA) and AMD (ROCm) builds of PyTorch both report their GPUs
-    through torch.cuda. Pass gpu_index to force a specific GPU.
-    """
-
+def choose_device(gpu_index: int | None = None) -> torch.device:
+    """Choose a GPU, preferring the device with most compute units."""
     if not torch.cuda.is_available():
-        print("=" * 70)
-        print("WARNING: no GPU available to PyTorch - training on the CPU.")
-        print("This is typically 20-50x slower than a GPU.")
-        print(f"Installed PyTorch: {torch.__version__}")
-        print("If this PC has a GPU, install the GPU build of PyTorch (see README).")
-        print("=" * 70)
+        if gpu_index is not None:
+            raise ValueError("--gpu was specified, but CUDA/ROCm is not available")
+        print("Using CPU (PyTorch cannot access a CUDA/ROCm GPU).")
         return torch.device("cpu")
 
     gpus = []
-
     for index in range(torch.cuda.device_count()):
         properties = torch.cuda.get_device_properties(index)
         gpus.append((properties.multi_processor_count, index, properties.name))
-        print(
-            f"Found GPU {index}: {properties.name} "
-            f"({properties.multi_processor_count} compute units, "
-            f"{properties.total_memory / 1024**3:.1f} GB)"
-        )
+        print(f"GPU {index}: {properties.name}")
 
     if gpu_index is not None:
         if not 0 <= gpu_index < len(gpus):
-            raise ValueError(f"--gpu {gpu_index} does not exist; found {len(gpus)} GPU(s)")
-
-        _, best_index, best_name = gpus[gpu_index]
+            raise ValueError(f"GPU index {gpu_index} is invalid")
+        selected = gpu_index
     else:
-        _, best_index, best_name = max(gpus)
+        _, selected, _ = max(gpus)
 
-    torch.cuda.set_device(best_index)
-    print(f"Using device: cuda:{best_index} ({best_name})")
+    torch.cuda.set_device(selected)
+    print(f"Using GPU {selected}")
+    return torch.device(f"cuda:{selected}")
 
-    return torch.device(f"cuda:{best_index}")
 
+def train_end_to_end(model_name: str, device: torch.device) -> None:
+    if model_name not in MODEL_PAIRS:
+        raise ValueError(f"Choose one of: {', '.join(MODEL_PAIRS)}")
+    image_name, sequence_name = MODEL_PAIRS[model_name]
 
-def main(
-    image_model=IMAGE_MODEL,
-    sequence_model=SEQUENCE_MODEL,
-    gpu_index=None,
-):
-
-    torch.manual_seed(RANDOM_SEED)
-
-    # -------------------------
-    # Device
-    # -------------------------
-    device = choose_device(gpu_index)
-
-    # Images are always the same size, so let the GPU library time its
-    # options once and keep the fastest (convolutions and LSTM/GRU).
-    torch.backends.cudnn.benchmark = True
-
-    model_path = ML_ROOT / "trained_models" / f"{image_model}-{sequence_model}.pt"
-
-    # -------------------------
-    # Dataset
-    # -------------------------
-
-    train_dataset = EquationDataset(TRAIN_FOLDER, augment=True)
-
-    extra_datasets = [
-        EquationDataset(folder, augment=True) for folder in EXTRA_TRAIN_FOLDERS if (folder / "X.npy").exists()
-    ]
-
-    if extra_datasets:
-        for folder in EXTRA_TRAIN_FOLDERS:
-            if (folder / "X.npy").exists():
-                print(f"Adding extra training data: {folder}")
-
-        train_dataset = ConcatDataset([train_dataset, *extra_datasets])
-
-    validation_dataset = EquationDataset(VALIDATION_FOLDER)
-
-    training_size = len(train_dataset)
-    validation_size = len(validation_dataset)
-
+    train_dataset = EquationDataset("train")
+    validation_dataset = EquationDataset("validation")
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        persistent_workers=NUM_WORKERS > 0,
         pin_memory=device.type == "cuda",
     )
-
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
     )
-
-    print(f"Training samples:   {training_size}")
-    print(f"Validation samples: {validation_size}")
-
-    # -------------------------
-    # Tokenizer
-    # -------------------------
 
     tokenizer = CTCTokenizer()
-
-    # -------------------------
-    # Model
-    # -------------------------
-
-    model = EquationRecognitionModel(
-        image_model=image_model,
-        sequence_model=sequence_model,
-    )
-
-    model = model.to(device)
-
-    # -------------------------
-    # CTC Loss
-    # -------------------------
-
-    criterion = EquationCTCLoss(
-        blank_index=tokenizer.blank_index,
-    )
-
-    # -------------------------
-    # Optimizer
-    # -------------------------
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-    )
-
+    model = EquationRecognitionModel(image_model=image_name, sequence_model=sequence_name).to(device)
+    criterion = EquationCTCLoss(blank_index=tokenizer.blank_index)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -350,103 +241,496 @@ def main(
         min_lr=MIN_LEARNING_RATE,
     )
 
-    # -------------------------
-    # Training
-    # -------------------------
-
-    model_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    best_validation_loss = float("inf")
+    # Use the existing checkpoint naming for compatibility with the API and
+    # ml.evaluate, both of which load a fully serialized PyTorch model.
+    checkpoint_path = MODEL_FOLDER / f"{image_name}-{sequence_name}.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    best_accuracy = -1.0
+    best_checkpoint_loss = float("inf")
+    best_epoch = 0
+    best_stopping_loss = float("inf")
     epochs_without_improvement = 0
 
+    print(f"Model: {model_name} | Train: {len(train_dataset):,} | " f"Validation: {len(validation_dataset):,}")
+
     for epoch in range(1, EPOCHS + 1):
-        epoch_start = time.time()
-
-        training_loss = train_one_epoch(
-            model,
-            train_loader,
-            tokenizer,
-            criterion,
-            optimizer,
-            device,
-        )
-
-        (
-            validation_loss,
-            sequence_accuracy,
-            token_error_rate,
-        ) = validate(
-            model,
-            validation_loader,
-            tokenizer,
-            criterion,
-            device,
+        train_accuracy = train_one_epoch(model, train_loader, tokenizer, criterion, optimizer, device)
+        validation_accuracy, validation_loss, _, _ = evaluate(
+            model, validation_loader, tokenizer, criterion, device, with_loss=True
         )
 
         print(
-            f"Epoch {epoch}/{EPOCHS} | "
-            f"Train Loss: {training_loss:.4f} | "
-            f"Validation Loss: {validation_loss:.4f} | "
-            f"Sequence Accuracy: {sequence_accuracy * 100:.2f}% | "
-            f"Token Error Rate: {token_error_rate * 100:.2f}% | "
-            f"LR: {optimizer.param_groups[0]['lr']:.0e} | "
-            f"Time: {time.time() - epoch_start:.0f}s"
+            f"Epoch {epoch:3d}/{EPOCHS} | "
+            f"Train Seq Acc: {train_accuracy * 100:6.2f}% | "
+            f"Val Seq Acc: {validation_accuracy * 100:6.2f}% | "
+            f"Val Loss: {validation_loss:.4f}"
         )
 
+        # Select the checkpoint by exact-sequence validation accuracy, breaking
+        # ties using validation loss. Never select based on test performance.
+        improved_accuracy = validation_accuracy > best_accuracy
+        better_checkpoint = improved_accuracy or (
+            validation_accuracy == best_accuracy and validation_loss < best_checkpoint_loss
+        )
+        if better_checkpoint:
+            best_accuracy = validation_accuracy
+            best_checkpoint_loss = validation_loss
+            best_epoch = epoch
+            torch.save(model, checkpoint_path)
+
         scheduler.step(validation_loss)
-
-        if validation_loss < best_validation_loss - EARLY_STOPPING_MIN_DELTA:
-            best_validation_loss = validation_loss
+        if validation_loss < best_stopping_loss - EARLY_STOPPING_MIN_DELTA or improved_accuracy:
+            best_stopping_loss = min(best_stopping_loss, validation_loss)
             epochs_without_improvement = 0
-
-            torch.save(
-                model,
-                model_path,
-            )
-
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-                print("Early stopping triggered.")
+                print(f"Early stopping after {epoch} epochs.")
                 break
 
-    print("\nTraining complete.")
-    print(f"Best model saved to: {model_path}")
+    print(f"\nBest epoch: {best_epoch} | Validation Seq Acc: {best_accuracy * 100:.2f}%")
+    print(f"Best checkpoint: {checkpoint_path}")
 
-    # Score the best model on data never used for training or model selection
-    best_model = torch.load(model_path, map_location=device, weights_only=False)
-    report_on_held_out_sets(best_model, tokenizer, device)
+    # Load the selected checkpoint and evaluate the held-out test split ONCE.
+    best_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    test_dataset = EquationDataset("test")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+    # Full metrics at the selected validation checkpoint, not the last epoch.
+    validation_accuracy, validation_loss, validation_ter, _ = evaluate(
+        best_model,
+        validation_loader,
+        tokenizer,
+        criterion,
+        device,
+        with_loss=True,
+        with_token_error=True,
+    )
+    test_accuracy, test_loss, test_token_error_rate, predictions = evaluate(
+        best_model,
+        test_loader,
+        tokenizer,
+        criterion,
+        device,
+        with_loss=True,
+        with_token_error=True,
+        collect_predictions=True,
+    )
+    print(f"Test Seq Acc (best epoch {best_epoch}, n={len(test_dataset):,}): " f"{test_accuracy * 100:.2f}%")
+    print(f"Test Token Error Rate: {test_token_error_rate * 100:.2f}%")
+
+    result = {
+        "architecture": "end_to_end",
+        "model": model_name,
+        "image_height": int(test_dataset.images.shape[1]),
+        "image_width": int(test_dataset.images.shape[2]),
+        "batch_size": BATCH_SIZE,
+        "training_samples": len(train_dataset),
+        "validation_samples": len(validation_dataset),
+        "test_samples": len(test_dataset),
+        "best_epoch": best_epoch,
+        "epochs_trained": epoch,
+        "validation_sequence_accuracy": validation_accuracy,
+        "validation_loss": validation_loss,
+        "validation_loss_type": "ctc",
+        "validation_token_error_rate": validation_ter,
+        "test_sequence_accuracy": test_accuracy,
+        "test_loss": test_loss,
+        "test_token_error_rate": test_token_error_rate,
+        "checkpoint": str(checkpoint_path.relative_to(ML_ROOT)),
+    }
+    save_model_result(model_name, result)
+    write_test_predictions(model_name, test_dataset.sources, test_dataset.equations, predictions, normalize=tokenizer)
+    print(f"Metrics: {RESULTS_FILE} | Predictions: {PREDICTIONS_FILE}")
+
+
+class SymbolDataset(Dataset):
+    """Load a CROHME23 split's rendered 128x128 PNG symbols and CSV labels."""
+
+    def __init__(self, split: str):
+        folder = SYMBOL_DATA_ROOT / split / "CROHME23" / "PNG"
+        manifest = folder / "labels.csv"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"Missing {manifest}; run dataset extraction first")
+
+        self.samples = []
+        label_to_id = {token: i for i, token in enumerate(SYMBOL_TOKENS)}
+        with manifest.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            if not {"image", "label"}.issubset(reader.fieldnames or []):
+                raise ValueError(f"Expected image,label columns in {manifest}")
+            for row in reader:
+                label = row["label"].strip()
+                if label not in label_to_id:
+                    raise ValueError(f"Unsupported label {label!r} in {manifest}")
+                path = folder / row["image"]
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing symbol PNG referenced by {manifest}: {path}")
+                self.samples.append((path, label_to_id[label]))
+        if not self.samples:
+            raise ValueError(f"No symbols listed in {manifest}")
+        self.targets = np.array([label for _, label in self.samples], dtype=np.int64)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        path, label = self.samples[index]
+        with Image.open(path) as im:
+            gray = np.asarray(im.convert("L"), dtype=np.uint8)
+        # The same symbol normalizer used after segmentation at inference.
+        symbol = preprocess_symbol_image(gray)
+        if symbol.shape != (IMAGE_HEIGHT, SYMBOL_WIDTH):
+            raise ValueError(f"Wrong symbol dimensions: {symbol.shape} in {path}")
+        # Classifier convention: black ink=1, white background=0.
+        image = torch.from_numpy(1.0 - symbol.astype(np.float32) / 255.0)
+        return image.unsqueeze(0), label
+
+
+def symbol_epoch(model, loader, criterion, device, optimizer=None) -> tuple[float, float]:
+    """Return weighted mean loss and token-level classification accuracy."""
+    training = optimizer is not None
+    model.train(training)
+    total_loss, correct, total = 0.0, 0, 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(training):
+            logits = model(images)
+            loss = criterion(logits, labels)
+            if training:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
+                optimizer.step()
+        total_loss += loss.item() * len(labels)
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+        total += len(labels)
+
+    return total_loss / total, correct / total
+
+
+def train_symbol_classifier(classifier: str, device: torch.device) -> None:
+    """Train only the classifier; segmentation itself has no learned weights."""
+    train_data = SymbolDataset("train")
+    validation_data = SymbolDataset("validation")
+    train_loader = DataLoader(
+        train_data,
+        batch_size=SYMBOL_BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        validation_data,
+        batch_size=SYMBOL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+
+    model = create_symbol_model(classifier, len(SYMBOL_TOKENS)).to(device)
+    counts = np.bincount(train_data.targets, minlength=len(SYMBOL_TOKENS))
+    missing = [SYMBOL_TOKENS[i] for i, count in enumerate(counts) if not count]
+    if missing:
+        raise ValueError(f"Missing symbol training classes: {missing}")
+    weights = 1.0 / np.sqrt(counts.astype(np.float64))
+    weights /= weights.mean()
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=SYMBOL_WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=LR_REDUCE_FACTOR,
+        patience=LR_REDUCE_PATIENCE,
+        min_lr=MIN_LEARNING_RATE,
+    )
+
+    MODEL_FOLDER.mkdir(parents=True, exist_ok=True)
+    checkpoint = MODEL_FOLDER / f"symbol-{classifier}.pt"
+    best_accuracy, best_loss, best_epoch = -1.0, float("inf"), 0
+    stopping_loss, no_improvement = float("inf"), 0
+    print(
+        f"Symbol classifier: {classifier} | Train: {len(train_data):,} | "
+        f"Validation: {len(validation_data):,} | Classes: {len(SYMBOL_TOKENS)}"
+    )
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_accuracy = symbol_epoch(model, train_loader, criterion, device, optimizer)
+        val_loss, val_accuracy = symbol_epoch(model, val_loader, criterion, device)
+        print(
+            f"Epoch {epoch:3d}/{EPOCHS} | Train Symbol Acc: {train_accuracy*100:6.2f}% | "
+            f"Val Symbol Acc: {val_accuracy*100:6.2f}% | Val Loss: {val_loss:.4f}"
+        )
+
+        improved_accuracy = val_accuracy > best_accuracy
+        if improved_accuracy or (val_accuracy == best_accuracy and val_loss < best_loss):
+            best_accuracy, best_loss, best_epoch = val_accuracy, val_loss, epoch
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model": classifier,
+                    "vocabulary": list(SYMBOL_TOKENS),
+                    "image_height": IMAGE_HEIGHT,
+                    "image_width": SYMBOL_WIDTH,
+                },
+                checkpoint,
+            )
+
+        scheduler.step(val_loss)
+        if val_loss < stopping_loss - EARLY_STOPPING_MIN_DELTA or improved_accuracy:
+            stopping_loss = min(stopping_loss, val_loss)
+            no_improvement = 0
+        else:
+            no_improvement += 1
+            if no_improvement >= EARLY_STOPPING_PATIENCE:
+                print(f"Early stopping after {epoch} epochs.")
+                break
+
+    print(f"Best symbol epoch: {best_epoch} | Val Symbol Acc: {best_accuracy * 100:.2f}%")
+    print(f"Best symbol checkpoint: {checkpoint}")
+    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(saved["model_state_dict"])
+    test_data = SymbolDataset("test")
+    test_loader = DataLoader(
+        test_data,
+        batch_size=SYMBOL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
+    _, test_accuracy = symbol_epoch(model, test_loader, criterion, device)
+    print(f"Test Symbol Accuracy (n={len(test_data):,}): {test_accuracy * 100:.2f}%")
+
+    # Saved under the shared metrics file, with separate classifier metrics.
+    save_model_result(
+        f"symbol-{classifier}",
+        {
+            "architecture": "symbol_classifier",
+            "model": classifier,
+            "image_height": IMAGE_HEIGHT,
+            "image_width": SYMBOL_WIDTH,
+            "batch_size": SYMBOL_BATCH_SIZE,
+            "training_samples": len(train_data),
+            "validation_samples": len(validation_data),
+            "test_samples": len(test_data),
+            "best_epoch": best_epoch,
+            "epochs_trained": epoch,
+            "validation_symbol_accuracy": best_accuracy,
+            "validation_symbol_loss": best_loss,
+            "test_symbol_accuracy": test_accuracy,
+            "checkpoint": str(checkpoint.relative_to(ML_ROOT)),
+        },
+    )
+    print(f"Metrics saved to: {RESULTS_FILE}")
+
+
+def save_model_result(model_name: str, metrics: dict) -> None:
+    """Update only one model's record in the consolidated results JSON."""
+    RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    results = json.loads(RESULTS_FILE.read_text(encoding="utf-8")) if RESULTS_FILE.exists() else {}
+    results[model_name] = metrics
+    RESULTS_FILE.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def write_test_predictions(model_name, sources, equations, predictions, normalize=None) -> None:
+    """Merge prediction column on source path; overwrite same model on reruns.
+
+    Preserve all other model columns, even when evaluated in a different order.
+    """
+    if not (len(sources) == len(equations) == len(predictions)):
+        raise ValueError("Prediction CSV row count does not match test dataset")
+    PREDICTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    rows = {}
+    other_columns = []
+    if PREDICTIONS_FILE.exists():
+        with PREDICTIONS_FILE.open(newline="", encoding="utf-8-sig") as file:
+            reader = csv.DictReader(file)
+            if not {"image", "equation"}.issubset(reader.fieldnames or []):
+                raise ValueError(f"Existing CSV has unexpected columns: {PREDICTIONS_FILE}")
+            other_columns = [field for field in reader.fieldnames if field not in ("image", "equation")]
+            for row in reader:
+                if row["image"] in rows:
+                    raise ValueError(f"Duplicate image key {row['image']!r} in {PREDICTIONS_FILE}")
+                rows[row["image"]] = row
+
+    seen = set()
+    for path, label, prediction in zip(sources, equations, predictions):
+        image_key = str(path).replace("\\", "/")
+        if image_key in seen:
+            raise ValueError(f"Duplicate image key in current dataset: {image_key}")
+        seen.add(image_key)
+        ground_truth = str(label)
+        if normalize is not None:
+            ground_truth = normalize.decode(normalize.encode(ground_truth))
+        row = rows.setdefault(image_key, {"image": image_key, "equation": ground_truth})
+        if row.get("equation") != ground_truth:
+            raise ValueError(f"Conflicting reference equation for {image_key!r}")
+        row[model_name] = prediction
+
+    columns = ["image", "equation", *other_columns]
+    if model_name not in columns:
+        columns.append(model_name)
+    # Missing predictions from runs using different source subsets are empty.
+    with PREDICTIONS_FILE.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows.values())
+
+
+def tokenize_equation(equation: str, tokenizer: CTCTokenizer) -> list[int]:
+    """Use the end-to-end vocabulary for sequence-level comparisons."""
+    return tokenizer.encode(equation)
+
+
+@torch.no_grad()
+def evaluate_segmented_equations(
+    classifier: str,
+    segmentation: str,
+    split: str,
+    device: torch.device,
+    collect_predictions: bool = False,
+):
+    """Evaluate a fixed segmentation method + trained classifier on whole equations.
+
+    No segmentation training occurs. Evaluate with the SAME preprocessed NPZ
+    equations used by the end-to-end models for a fair comparison.
+    """
+    dataset = EquationDataset(split)
+    checkpoint_path = MODEL_FOLDER / f"symbol-{classifier}.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Symbol classifier not trained: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    vocabulary = checkpoint.get("vocabulary")
+    if not vocabulary:
+        raise ValueError(f"Checkpoint has no token vocabulary: {checkpoint_path}")
+    if tuple(vocabulary) != SYMBOL_TOKENS:
+        raise ValueError(f"Checkpoint token order differs from current config: {checkpoint_path}")
+    if (checkpoint.get("image_height"), checkpoint.get("image_width")) != (IMAGE_HEIGHT, SYMBOL_WIDTH):
+        raise ValueError(f"Checkpoint dimensions do not match symbol config: {checkpoint_path}")
+    model = create_symbol_model(classifier, len(vocabulary)).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    method = SEGMENTATION_NAMES[segmentation]
+    segmenter = SEGMENTATION_METHODS[method]
+    tokenizer = CTCTokenizer()
+    correct, edits, target_length = 0, 0, 0
+    predictions = []
+    for index in range(len(dataset)):
+        segments = segmenter(dataset.images[index])
+        if segments:
+            batch = np.stack([preprocess_symbol_image(segment.image) for segment in segments])
+            tensor = torch.from_numpy(1.0 - batch.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+            ids = model(tensor).argmax(dim=1).cpu().tolist()
+            prediction = "".join(vocabulary[token_id] for token_id in ids)
+        else:
+            prediction = ""
+        label = str(dataset.equations[index])
+        target = tokenize_equation(label, tokenizer)
+        predicted = tokenize_equation(prediction, tokenizer)
+        correct += predicted == target
+        edits += edit_distance(predicted, target)
+        target_length += len(target)
+        if collect_predictions:
+            predictions.append(prediction)
+        if (index + 1) % 500 == 0:
+            print(f"  {split} {method}/{classifier}: {index+1:,}/{len(dataset):,}", flush=True)
+    return (
+        {
+            "sequence_accuracy": correct / len(dataset),
+            "token_error_rate": edits / target_length if target_length else None,
+            "samples": len(dataset),
+        },
+        predictions,
+        dataset,
+    )
+
+
+def evaluate_segmentation_selection(selection: str, device: torch.device) -> None:
+    method, classifier = SEGMENTATION_PAIRS[selection]
+    print(f"Evaluating {selection} on whole-equation validation/test splits")
+    validation, _, _ = evaluate_segmented_equations(classifier, method, "validation", device)
+    test, predictions, dataset = evaluate_segmented_equations(
+        classifier, method, "test", device, collect_predictions=True
+    )
+    classifier_metrics = json.loads(RESULTS_FILE.read_text(encoding="utf-8")).get(f"symbol-{classifier}", {})
+    save_model_result(
+        selection,
+        {
+            "architecture": "segmentation_based",
+            "model": selection,
+            "segmentation_method": SEGMENTATION_NAMES[method],
+            "classifier": classifier,
+            "image_height": int(dataset.images.shape[1]),
+            "image_width": int(dataset.images.shape[2]),
+            "symbol_height": IMAGE_HEIGHT,
+            "symbol_width": SYMBOL_WIDTH,
+            "batch_size": SYMBOL_BATCH_SIZE,
+            "training_samples": classifier_metrics.get("training_samples"),
+            "validation_samples": validation["samples"],
+            "test_samples": test["samples"],
+            "best_epoch": classifier_metrics.get("best_epoch"),
+            "epochs_trained": classifier_metrics.get("epochs_trained"),
+            "validation_sequence_accuracy": validation["sequence_accuracy"],
+            # This loss is the symbol classifier's cross entropy, NOT a sequence loss.
+            "validation_loss": classifier_metrics.get("validation_symbol_loss"),
+            "validation_loss_type": "symbol_cross_entropy",
+            "validation_token_error_rate": validation["token_error_rate"],
+            "test_sequence_accuracy": test["sequence_accuracy"],
+            "test_loss": None,
+            "test_token_error_rate": test["token_error_rate"],
+            "classifier_validation_symbol_accuracy": classifier_metrics.get("validation_symbol_accuracy"),
+            "classifier_validation_symbol_loss": classifier_metrics.get("validation_symbol_loss"),
+            "classifier_test_symbol_accuracy": classifier_metrics.get("test_symbol_accuracy"),
+            "checkpoint": str((MODEL_FOLDER / f"symbol-{classifier}.pt").relative_to(ML_ROOT)),
+        },
+    )
+    write_test_predictions(selection, dataset.sources, dataset.equations, predictions)
+    print(f"  Validation sequence accuracy: {validation['sequence_accuracy']:.2%}")
+    print(f"  Test sequence accuracy: {test['sequence_accuracy']:.2%} | Test TER: {test['token_error_rate']:.2%}")
+    print(f"Metrics: {RESULTS_FILE} | Predictions: {PREDICTIONS_FILE}")
+
+
+def main(model_names: list[str], gpu_index: int | None = None) -> None:
+    """Train each distinct classifier once, then evaluate requested full pipelines."""
+    bad = sorted(set(model_names) - set(MODEL_CHOICES))
+    if bad:
+        raise ValueError(f"Unknown model(s): {bad}; choose from {list(MODEL_CHOICES)}")
+    device = choose_device(gpu_index)
+    torch.backends.cudnn.benchmark = device.type == "cuda"
+    trained_classifiers = set()
+    # Train only two symbol classifiers even when six segmentation combinations
+    # are selected. Evaluate all requested full pipelines afterward.
+    for selection in dict.fromkeys(model_names):
+        random.seed(RANDOM_SEED)
+        torch.manual_seed(RANDOM_SEED)
+        np.random.seed(RANDOM_SEED)
+        print(f"\n{'='*65}\nSelected: {selection}\n{'='*65}", flush=True)
+        if selection in MODEL_PAIRS:
+            train_end_to_end(selection, device)
+        else:
+            _, classifier = SEGMENTATION_PAIRS[selection]
+            if classifier not in trained_classifiers:
+                train_symbol_classifier(classifier, device)
+                trained_classifiers.add(classifier)
+            else:
+                print(f"Reusing trained {classifier} symbol checkpoint")
+            evaluate_segmentation_selection(selection, device)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--image-model",
-        choices=IMAGE_MODEL_CHOICES,
-        default=IMAGE_MODEL,
-    )
-
-    parser.add_argument(
-        "--sequence-model",
-        choices=SEQUENCE_MODEL_CHOICES,
-        default=SEQUENCE_MODEL,
-    )
-
-    parser.add_argument(
-        "--gpu",
-        type=int,
-        default=None,
-        help="Index of the GPU to use (as listed in 'Found GPU N'). Default: the most powerful one.",
-    )
-
-    arguments = parser.parse_args()
-
-    main(
-        image_model=arguments.image_model,
-        sequence_model=arguments.sequence_model,
-        gpu_index=arguments.gpu,
-    )
+    parser = argparse.ArgumentParser(description="Train end-to-end models and/or symbol classifiers")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--model", choices=tuple(MODEL_CHOICES), help="Train one selected model")
+    selection.add_argument("--models", nargs="+", choices=tuple(MODEL_CHOICES), help="Train selections sequentially")
+    parser.add_argument("--all", action="store_true", help="Run all 9 model selections")
+    parser.add_argument("--gpu", type=int, default=None, help="CUDA/ROCm GPU index")
+    args = parser.parse_args()
+    main(list(MODEL_CHOICES) if args.all else (args.models or [args.model or DEFAULT_MODEL]), gpu_index=args.gpu)

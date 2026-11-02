@@ -10,37 +10,46 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { ImageIcon } from 'lucide-react';
 import { calculateEquation, CalculatorResult } from '@/actions/calculate_action';
 import Image from 'next/image';
 import { BlockMath } from 'react-katex';
 
 export default function Home() {
-    const Image_models = [
-        { label: 'CNN', value: 'cnn' },
-        { label: 'ResNet', value: 'resnet' },
-        { label: 'Visual Transformer', value: 'vision_transformer' },
-    ];
+    type Architecture = 'end_to_end' | 'segmentation';
 
-    const Sequence_models = [
-        { label: 'BILSTM', value: 'bilstm' },
-        { label: 'GRU', value: 'gru' },
-        { label: 'Transformer', value: 'transformer' },
-    ];
+    const MODEL_OPTIONS: Record<Architecture, { label: string; value: string }[]> = {
+        end_to_end: [
+            { label: 'CNN + GRU', value: 'cnn-gru' },
+            { label: 'ResNet + BiLSTM', value: 'resnet-bilstm' },
+            { label: 'Vision Transformer + Transformer', value: 'vit-transformer' },
+        ],
+        segmentation: [
+            // Add your segmentation-based model configurations here.
+        ],
+    };
 
     const [loading, setLoading] = useState(false);
     const [file, setFile] = useState<File | null>(null);
     const [result, setResult] = useState<CalculatorResult | null>(null);
     const [error, setError] = useState('');
 
-    const [imageModel, setImageModel] = useState(Image_models[0].value);
-    const [sequenceModel, setSequenceModel] = useState(Sequence_models[0].value);
+    const [architecture, setArchitecture] = useState<Architecture>('end_to_end');
+    const [model, setModel] = useState<string | null>('cnn_bilstm');
+
+    const availableModels = MODEL_OPTIONS[architecture];
 
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
     async function handleCalculate() {
         if (!file) {
             setError('Please select an image.');
+            return;
+        }
+
+        if (!model || !availableModels.some((option) => option.value === model)) {
+            setError('Please select a valid model configuration.');
             return;
         }
 
@@ -51,8 +60,8 @@ export default function Home() {
             const formData = new FormData();
 
             formData.append('image', file);
-            formData.append('imageModel', imageModel);
-            formData.append('sequenceModel', sequenceModel);
+            formData.append('architecture', architecture);
+            formData.append('model', model!);
 
             const response = await calculateEquation(formData);
 
@@ -88,7 +97,7 @@ export default function Home() {
                     <span className="text-[#0051D5] font-bold text-3xl">handwritten equations</span>
                 </h1>
                 <p className="text-[#45464D] text-base">
-                    Upload an equation image, choose a model combination, and calculate the result.
+                    Choose a recognition architecture, select a model, and upload an equation image.
                 </p>
             </div>
 
@@ -158,77 +167,89 @@ export default function Home() {
                         />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-3">
-                        <div className="flex flex-col gap-1">
-                            <h3 className="text-[#002B75] font-semibold text-xs">
-                                Image analysis model
+                    <div className="flex flex-col gap-5">
+                        <div className="flex flex-col gap-3">
+                            <h3 className="text-[#002B75] font-semibold text-sm">
+                                Recognition architecture
                             </h3>
-                            <p className="text-xs text-[#45464D]">
-                                Finds visual patterns in the handwriting.
-                            </p>
-                            <Select
-                                items={Image_models}
-                                value={imageModel}
+
+                            <RadioGroup
+                                className="grid grid-cols-1 sm:grid-cols-2 gap-3"
+                                value={architecture}
+                                disabled={loading}
                                 onValueChange={(value) => {
-                                    if (value !== null) {
-                                        setImageModel(value);
-                                    }
+                                    if (value !== 'end_to_end' && value !== 'segmentation') return;
+
+                                    setArchitecture(value);
+                                    setModel(null);
+                                    setResult(null);
+                                    setError('');
                                 }}
                             >
-                                <SelectTrigger className="w-full">
-                                    <SelectValue placeholder="Select a model" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {Image_models.map((model) => (
-                                        <SelectItem
-                                            key={model.value}
-                                            value={model.value}
-                                            className="pl-2.75"
-                                        >
-                                            {model.label}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
+                                <label
+                                    className={`flex items-center gap-3 rounded-md border p-4 cursor-pointer ${
+                                        architecture === 'end_to_end'
+                                            ? 'border-[#0051D5] bg-[#EFF4FF]'
+                                            : 'border-[#C6C6CD]'
+                                    }`}
+                                >
+                                    <RadioGroupItem value="end_to_end" />
+                                    <span className="text-sm font-medium">End-to-End</span>
+                                </label>
+
+                                <label
+                                    className={`flex items-center gap-3 rounded-md border p-4 cursor-pointer ${
+                                        architecture === 'segmentation'
+                                            ? 'border-[#0051D5] bg-[#EFF4FF]'
+                                            : 'border-[#C6C6CD]'
+                                    }`}
+                                >
+                                    <RadioGroupItem value="segmentation" />
+                                    <span className="text-sm font-medium">Segmentation-Based</span>
+                                </label>
+                            </RadioGroup>
                         </div>
-                        <div className="flex flex-col gap-1">
-                            <h3 className="text-[#002B75] font-semibold text-xs">
-                                Sequence reading model
+
+                        <div className="flex flex-col gap-2">
+                            <h3 className="text-[#002B75] font-semibold text-sm">
+                                Model configuration
                             </h3>
-                            <p className="text-xs text-[#45464D]">
-                                Reads the detected features in order.
-                            </p>
+
                             <Select
-                                items={Sequence_models}
-                                value={sequenceModel}
+                                items={availableModels}
+                                value={model}
+                                disabled={loading || availableModels.length === 0}
                                 onValueChange={(value) => {
-                                    if (value !== null) {
-                                        setSequenceModel(value);
-                                    }
+                                    setModel(typeof value === 'string' ? value : null);
+                                    setResult(null);
+                                    setError('');
                                 }}
                             >
                                 <SelectTrigger className="w-full">
                                     <SelectValue placeholder="Select a model" />
                                 </SelectTrigger>
+
                                 <SelectContent>
-                                    {Sequence_models.map((model) => (
-                                        <SelectItem
-                                            key={model.value}
-                                            value={model.value}
-                                            className="pl-2.75"
-                                        >
-                                            {model.label}
+                                    {availableModels.map((option) => (
+                                        <SelectItem key={option.value} value={option.value}>
+                                            {option.label}
                                         </SelectItem>
                                     ))}
                                 </SelectContent>
                             </Select>
+
+                            {availableModels.length === 0 && (
+                                <p className="text-xs text-[#45464D]">
+                                    No models configured for this architecture yet.
+                                </p>
+                            )}
                         </div>
                     </div>
 
                     <Button
                         className="bg-[#0051D5] text-white py-2.5 rounded-md"
                         onClick={handleCalculate}
-                        disabled={loading}
+                        disabled={loading || !model}
                     >
                         {loading ? 'Calculating...' : 'Calculate'}
                     </Button>
