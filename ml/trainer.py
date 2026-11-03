@@ -16,7 +16,7 @@ from ml.end_to_end.ctc.ctc_loss import EquationCTCLoss
 from ml.end_to_end.ctc.decoder import greedy_decode
 from ml.end_to_end.ctc.tokenizer import CTCTokenizer
 from ml.end_to_end.equation_recognition_model import EquationRecognitionModel
-from ml.end_to_end.evaluation.evaluation import edit_distance
+from ml.end_to_end.evaluation import edit_distance
 
 
 from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH, SYMBOL_WIDTH, TOKENS, BLANK_TOKEN
@@ -350,46 +350,45 @@ def train_end_to_end(model_name: str, device: torch.device) -> None:
 
 
 class SymbolDataset(Dataset):
-    """Load a CROHME23 split's rendered 128x128 PNG symbols and CSV labels."""
+    """Read preprocessed symbol images and labels from one NPZ."""
 
     def __init__(self, split: str):
-        folder = SYMBOL_DATA_ROOT / split / "CROHME23" / "PNG"
-        manifest = folder / "labels.csv"
-        if not manifest.is_file():
-            raise FileNotFoundError(f"Missing {manifest}; run dataset extraction first")
+        path = SYMBOL_DATA_ROOT / split / "preprocessed.npz"
 
-        self.samples = []
-        label_to_id = {token: i for i, token in enumerate(SYMBOL_TOKENS)}
-        with manifest.open(newline="", encoding="utf-8-sig") as handle:
-            reader = csv.DictReader(handle)
-            if not {"image", "label"}.issubset(reader.fieldnames or []):
-                raise ValueError(f"Expected image,label columns in {manifest}")
-            for row in reader:
-                label = row["label"].strip()
-                if label not in label_to_id:
-                    raise ValueError(f"Unsupported label {label!r} in {manifest}")
-                path = folder / row["image"]
-                if not path.is_file():
-                    raise FileNotFoundError(f"Missing symbol PNG referenced by {manifest}: {path}")
-                self.samples.append((path, label_to_id[label]))
-        if not self.samples:
-            raise ValueError(f"No symbols listed in {manifest}")
-        self.targets = np.array([label for _, label in self.samples], dtype=np.int64)
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {path}; run python -m ml.preprocessing first")
 
-    def __len__(self) -> int:
-        return len(self.samples)
+        with np.load(path, allow_pickle=False) as archive:
+            self.images = archive["images"]
+            labels = archive["labels"]
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        path, label = self.samples[index]
-        with Image.open(path) as im:
-            gray = np.asarray(im.convert("L"), dtype=np.uint8)
-        # The same symbol normalizer used after segmentation at inference.
-        symbol = preprocess_symbol_image(gray)
-        if symbol.shape != (IMAGE_HEIGHT, SYMBOL_WIDTH):
-            raise ValueError(f"Wrong symbol dimensions: {symbol.shape} in {path}")
-        # Classifier convention: black ink=1, white background=0.
-        image = torch.from_numpy(1.0 - symbol.astype(np.float32) / 255.0)
-        return image.unsqueeze(0), label
+        if (
+            self.images.ndim != 3
+            or self.images.shape[1:] != (IMAGE_HEIGHT, SYMBOL_WIDTH)
+            or self.images.dtype != np.uint8
+            or labels.ndim != 1
+            or len(self.images) != len(labels)
+            or len(labels) == 0
+        ):
+            raise ValueError(f"Invalid symbol dataset: {path}")
+
+        label_to_id = {token: index for index, token in enumerate(SYMBOL_TOKENS)}
+
+        self.targets = np.asarray(
+            [label_to_id[str(label)] for label in labels],
+            dtype=np.int64,
+        )
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        image = self.images[index].astype(np.float32)
+
+        # Symbol classifier: black=1, white=0.
+        image = torch.from_numpy(1.0 - image / 255.0)
+
+        return image.unsqueeze(0), int(self.targets[index])
 
 
 def symbol_epoch(model, loader, criterion, device, optimizer=None) -> tuple[float, float]:

@@ -29,3 +29,6 @@ next-env.d.ts
 Thumbs.db
 .idea/
 .vscode/
+
+# Kaggle training package
+/kaggle_training.zip

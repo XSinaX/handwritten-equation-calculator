@@ -1,11 +1,12 @@
 from torch import nn
 
-from ml.models.image_models.basic_cnn import BasicCNN
-from ml.models.image_models.resnet import ResNet
-from ml.models.image_models.vision_transformer import VisionTransformer
-from ml.models.sequence_models.bilstm import BiLSTM
-from ml.models.sequence_models.gru import GRU
-from ml.models.sequence_models.transformer import Transformer
+from ml.end_to_end.image_models.basic_cnn import BasicCNN
+from ml.end_to_end.image_models.resnet import ResNet
+from ml.end_to_end.image_models.vision_transformer import VisionTransformer
+
+from ml.end_to_end.sequence_models.bilstm import BiLSTM
+from ml.end_to_end.sequence_models.gru import GRU
+from ml.end_to_end.sequence_models.transformer import Transformer
 
 
 class EquationRecognitionModel(nn.Module):

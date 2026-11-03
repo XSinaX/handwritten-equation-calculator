@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from functools import lru_cache
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -64,10 +65,15 @@ def load_layout_statistics(path: Path = LAYOUT_STATS_PATH) -> dict:
     return data
 
 
-def load_symbol_traces(symbol: dict) -> dict:
-    """Read X/Y and optional T from symbol InkML; move its bounds to (0, 0)."""
-    path = Path(symbol["file_path"])
+@lru_cache(maxsize=4096)
+def _read_symbol_file(path: Path) -> tuple:
+    """Parse each InkML file once per worker (bounded cache)."""
     root = ET.parse(path).getroot()
+    label = next(
+        ((child.text or "").strip() for child in root
+         if child.tag.endswith("annotation") and child.get("type") == "label"),
+        None,
+    )
     trace_format = next((child for child in root if child.tag.endswith("traceFormat")), None)
     channels = (
         [channel.get("name") for channel in trace_format if channel.tag.endswith("channel")]
@@ -100,7 +106,23 @@ def load_symbol_traces(symbol: dict) -> dict:
     if not traces:
         raise ValueError(f"No strokes in {path}")
     normalized, width, height = shift_traces_to_origin(traces)
-    return {**symbol, "traces": normalized, "width": width, "height": height}
+    return label, normalized, width, height
+
+
+def load_symbol_label(path: Path) -> str | None:
+    """Read the symbol label from the same cached InkML parse as its strokes."""
+    return _read_symbol_file(Path(path))[0]
+
+
+def load_symbol_traces(symbol: dict) -> dict:
+    """Return independent stroke lists, safe to rescale or rotate per equation."""
+    _, normalized, width, height = _read_symbol_file(Path(symbol["file_path"]))
+    return {
+        **symbol,
+        "traces": [trace.copy() for trace in normalized],
+        "width": width,
+        "height": height,
+    }
 
 
 def shift_traces_to_origin(traces: list) -> tuple[list, float, float]:

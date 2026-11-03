@@ -50,10 +50,7 @@ def read_strokes(inkml: str | Path | ET.Element) -> list[list[tuple[float, float
 
 
 def make_paper(width: int, height: int, rng: np.random.Generator) -> np.ndarray:
-    """Create off-white paper with subtle texture and uneven lighting.
-
-    Deliberately excludes ruled lines: our dataset does not require them.
-    """
+    """Create off-white paper with subtle texture and uneven lighting."""
     paper_colour = np.array(
         [rng.uniform(220, 245), rng.uniform(225, 250), rng.uniform(230, 255)],
         dtype=np.float32,

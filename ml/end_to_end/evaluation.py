@@ -1,4 +1,4 @@
-from ml.models.ctc.decoder import greedy_decode
+from ml.end_to_end.ctc.decoder import greedy_decode
 
 
 def edit_distance(predicted_tokens, target_tokens):

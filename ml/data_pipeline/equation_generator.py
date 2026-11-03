@@ -1,21 +1,8 @@
-"""Build random arithmetic equations and render one synthetic PNG per sample.
-
-Run from the repository root:
-    python -m ml.data_pipeline.equation_generator
-
-For each split, uses ONLY that split's CROHME23 symbol InkML drawings:
-    ml/datasets/symbol/{train,validation,test}/CROHME23/InkML/*.inkml
-
-Writes PNG images and labels.csv (image,equation,type) to:
-    ml/datasets/equation/{train,validation,test}/Synthetic/
-
-Equation grammar and token/file choices live here; stroke geometry lives in
-ml.data_pipeline.equation_layout; photo appearance lives in photo_renderer.
-"""
-
 from __future__ import annotations
 
 import csv
+import os
+from concurrent.futures import ProcessPoolExecutor
 import random
 import uuid
 import xml.etree.ElementTree as ET
@@ -24,11 +11,12 @@ from pathlib import Path
 from ml.data_pipeline.equation_layout import (
     layout_equation,
     load_layout_statistics,
+    load_symbol_label,
     load_symbol_traces,
 )
 from ml.data_pipeline.photo_renderer import render_photo
 
-SAMPLES_PER_SPLIT = {"train": 20000, "validation": 3000, "test": 3000}
+SAMPLES_PER_SPLIT = {"train": 30000, "validation": 5000, "test": 5000}
 MAX_OPERANDS = 4
 MAX_DIGITS_PER_NUMBER = 3
 MAX_EXPRESSION_IN_OPERANDS = 2
@@ -47,6 +35,13 @@ SYMBOL_DATASET = "CROHME23"
 SYNTHETIC_FOLDER_NAME = "Synthetic"
 MIN_PEN_WIDTH = 3
 MAX_PEN_WIDTH = 6
+NUM_WORKERS = 8
+WORK_BATCH_SIZE = 256
+WORK_CHUNK_SIZE = 8
+
+_worker_symbol_files = None
+_worker_stats = None
+_worker_output_dir = None
 
 
 def create_symbol_file_dictionary(split: str) -> dict[str, list[Path]]:
@@ -63,23 +58,15 @@ def create_symbol_file_dictionary(split: str) -> dict[str, list[Path]]:
     skipped_invalid = {token: 0 for token in TOKENS}
 
     for path in sorted(folder.glob("*.inkml")):
-        root = ET.parse(path).getroot()
-        # The extracted symbols have one top-level <annotation type="label">.
-        label = next(
-            (
-                (child.text or "").strip()
-                for child in root
-                if child.tag.endswith("annotation") and child.get("type") == "label"
-            ),
-            None,
-        )
-        if label not in symbol_files:
-            continue
-
+        label = None
         try:
+            label = load_symbol_label(path)
+            if label not in symbol_files:
+                continue
             geometry = load_symbol_traces({"token": label, "file_path": path})
         except (OSError, ET.ParseError, ValueError):
-            skipped_invalid[label] += 1
+            if label in skipped_invalid:
+                skipped_invalid[label] += 1
             continue
 
         if label in set(OPERATORS) | {"="}:
@@ -188,26 +175,50 @@ def generate_equation(symbol_files: dict) -> tuple[str, list[dict]]:
     return "".join(symbol["token"] for symbol in result), result
 
 
+def initialize_generator_worker(symbol_files: dict, stats: dict, output_dir: Path) -> None:
+    """Initialize one worker and seed it independently."""
+    global _worker_symbol_files, _worker_stats, _worker_output_dir
+    _worker_symbol_files = symbol_files
+    _worker_stats = stats
+    _worker_output_dir = output_dir
+    random.seed(int.from_bytes(os.urandom(16), "big"))
+
+
+def generate_one_image(_index: int) -> tuple[str, str]:
+    """Generate and save one image; return its CSV row to the parent process."""
+    equation, selected_symbols = generate_equation(_worker_symbol_files)
+    inkml = layout_equation(selected_symbols, _worker_stats)
+    filename = f"synthetic_{uuid.uuid4().hex}.png"
+    render_photo(
+        inkml,
+        _worker_output_dir / filename,
+        line_width=random.randint(MIN_PEN_WIDTH, MAX_PEN_WIDTH),
+    )
+    return filename, equation
+
+
 def generate_split(split: str, count: int, stats: dict) -> None:
-    """Generate images and append their labels alongside them in each split."""
+    """Generate equations in four workers and replace this split's labels.csv."""
     symbol_files = create_symbol_file_dictionary(split)
     output_dir = DATASETS_ROOT / "equation" / split / SYNTHETIC_FOLDER_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "labels.csv"
 
-    # Appending preserves earlier runs, and filenames use UUIDs to avoid clashes.
-    with csv_path.open("a", newline="", encoding="utf-8") as stream:
+    # The parent process is the only CSV writer. Opening with 'w' discards
+    # previous CSV rows; workers independently create new PNG files.
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=("image", "equation", "type"))
-        if csv_path.stat().st_size == 0:
-            writer.writeheader()
+        writer.writeheader()
 
-        for _ in range(count):
-            equation, selected_symbols = generate_equation(symbol_files)
-            inkml = layout_equation(selected_symbols, stats)
-            filename = f"synthetic_{uuid.uuid4().hex}.png"
-            render_photo(inkml, output_dir / filename, line_width=random.randint(MIN_PEN_WIDTH, MAX_PEN_WIDTH))
-            # Relative image path resolves from the labels.csv directory.
-            writer.writerow({"image": filename, "equation": equation, "type": "synthetic"})
+        with ProcessPoolExecutor(
+            max_workers=NUM_WORKERS,
+            initializer=initialize_generator_worker,
+            initargs=(symbol_files, stats, output_dir),
+        ) as pool:
+            for start in range(0, count, WORK_BATCH_SIZE):
+                indices = range(start, min(start + WORK_BATCH_SIZE, count))
+                for filename, equation in pool.map(generate_one_image, indices, chunksize=WORK_CHUNK_SIZE):
+                    writer.writerow({"image": filename, "equation": equation, "type": "synthetic"})
 
     print(f"{split}: generated {count:,} PNGs in {output_dir}")
 

@@ -12,7 +12,7 @@ from PIL import Image
 from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH, SYMBOL_WIDTH
 
 EQUATION_PADDING = 5
-DATASETS_ROOT = Path(__file__).resolve().parent.parent / "datasets"
+DATASETS_ROOT = Path(__file__).resolve().parent / "datasets"
 SPLITS = ("train", "validation", "test")
 OUTPUT_FILENAME = "preprocessed.npz"
 NUM_WORKERS = min(6, os.cpu_count() or 1)
@@ -328,6 +328,100 @@ def preprocess_split(split: str, datasets_root: Path = DATASETS_ROOT, workers: i
     return count, skipped
 
 
+def process_symbol_sample(sample):
+    """Load and preprocess one rendered CROHME symbol."""
+    path, label = sample
+
+    try:
+        if not label:
+            raise ValueError("Empty symbol label")
+
+        with Image.open(path) as image:
+            grayscale = np.asarray(image.convert("L"), dtype=np.uint8)
+
+        processed = preprocess_symbol_image(grayscale)
+        return processed, None
+
+    except (OSError, ValueError, cv2.error) as error:
+        return None, str(error)
+
+
+def preprocess_symbol_split(split: str, workers: int = NUM_WORKERS):
+    """Combine preprocessed symbols into one NPZ per split."""
+    split_folder = DATASETS_ROOT / "symbol" / split
+    png_folder = split_folder / "CROHME23" / "PNG"
+    csv_path = png_folder / "labels.csv"
+
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Missing symbol labels: {csv_path}")
+
+    with csv_path.open(newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        if not {"image", "label"}.issubset(reader.fieldnames or []):
+            raise ValueError(f"Expected image,label columns in {csv_path}")
+
+        samples = [(png_folder / row["image"], row["label"].strip()) for row in reader]
+
+    if not samples:
+        raise ValueError(f"No symbols found in {csv_path}")
+
+    labels, sources = [], []
+    skipped = 0
+
+    with tempfile.TemporaryDirectory(dir=split_folder) as temp:
+        images = np.lib.format.open_memmap(
+            Path(temp) / "images.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(len(samples), IMAGE_HEIGHT, SYMBOL_WIDTH),
+        )
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=configure_worker,
+            ) as pool:
+                for start in range(0, len(samples), WORK_BATCH_SIZE):
+                    batch = samples[start : start + WORK_BATCH_SIZE]
+
+                    results = pool.map(
+                        process_symbol_sample,
+                        batch,
+                        chunksize=WORK_CHUNK_SIZE,
+                    )
+
+                    for (path, label), (processed, error) in zip(batch, results):
+                        if error is not None:
+                            skipped += 1
+                            if skipped <= 5:
+                                print(f"Skipped {path}: {error}")
+                            continue
+
+                        index = len(labels)
+                        images[index] = processed
+                        labels.append(label)
+                        sources.append(path.relative_to(split_folder).as_posix())
+
+            count = len(labels)
+            if not count:
+                raise ValueError(f"No valid symbols in {split}")
+
+            images.flush()
+            output = split_folder / OUTPUT_FILENAME
+
+            np.savez_compressed(
+                output,
+                images=images[:count],
+                labels=np.asarray(labels, dtype=np.str_),
+                sources=np.asarray(sources, dtype=np.str_),
+            )
+
+        finally:
+            del images
+
+    print(f"Symbol {split}: saved {count:,} images to {output} (skipped {skipped:,})")
+
+
 def main() -> None:
     """Preprocess each split into one NumPy archive using multiple workers."""
     parser = argparse.ArgumentParser(description="Preprocess equation images in parallel")
@@ -340,6 +434,7 @@ def main() -> None:
 
     for split in SPLITS:
         preprocess_split(split, workers=args.workers)
+        preprocess_symbol_split(split, workers=args.workers)
 
 
 if __name__ == "__main__":

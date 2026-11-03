@@ -26,7 +26,8 @@ export default function Home() {
             { label: 'Vision Transformer + Transformer', value: 'vit-transformer' },
         ],
         segmentation: [
-            // Add your segmentation-based model configurations here.
+            { label: 'Augmented CCL + CNN', value: 'seg-aug-cnn' },
+            { label: 'Augmented CCL + ResNet', value: 'seg-aug-resnet' },
         ],
     };
 
