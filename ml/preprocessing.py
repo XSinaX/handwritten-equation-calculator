@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH, SYMBOL_WIDTH
+from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH
 
 EQUATION_PADDING = 5
 DATASETS_ROOT = Path(__file__).resolve().parent / "datasets"
@@ -24,43 +24,6 @@ DARK_BORDER_MIN_AREA_RATIO = 0.005
 TINY_WIDTH_RATIO = 0.30
 TINY_HEIGHT_RATIO = 0.30
 MAX_NOISE_DISTANCE_RATIO = 0.70
-SYMBOL_PADDING = 5
-
-
-def preprocess_symbol_image(image: np.ndarray) -> np.ndarray:
-    """Center black ink on white, preserving aspect ratio and 5px minimum padding.
-
-    Input: 2-D uint8 image with black ink (0) and white background (255).
-    Output: 2-D uint8 image of shape (IMAGE_HEIGHT, SYMBOL_WIDTH).
-    """
-    if image.ndim != 2 or image.dtype != np.uint8 or not image.size:
-        raise ValueError("Expected a non-empty 2-D uint8 symbol image")
-
-    ys, xs = np.nonzero(image < 245)
-    if not len(xs):
-        raise ValueError("Symbol contains no dark ink pixels")
-
-    crop = image[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-    max_height = IMAGE_HEIGHT - 2 * SYMBOL_PADDING
-    max_width = SYMBOL_WIDTH - 2 * SYMBOL_PADDING
-    if max_height < 1 or max_width < 1:
-        raise ValueError("Symbol dimensions are too small for the requested padding")
-
-    height, width = crop.shape
-    scale = min(max_height / height, max_width / width)
-    scaled_height = max(1, min(max_height, round(height * scale)))
-    scaled_width = max(1, min(max_width, round(width * scale)))
-    resized = cv2.resize(
-        crop,
-        (scaled_width, scaled_height),
-        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
-    )
-
-    canvas = np.full((IMAGE_HEIGHT, SYMBOL_WIDTH), 255, dtype=np.uint8)
-    top = (IMAGE_HEIGHT - scaled_height) // 2
-    left = (SYMBOL_WIDTH - scaled_width) // 2
-    canvas[top : top + scaled_height, left : left + scaled_width] = resized
-    return canvas
 
 
 def image_to_grayscale(image: np.ndarray) -> np.ndarray:
@@ -321,105 +284,10 @@ def preprocess_split(split: str, datasets_root: Path = DATASETS_ROOT, workers: i
                 types=np.asarray(types, dtype=np.str_),
             )
         finally:
-            # On Windows the temporary memmap must be released before cleanup.
             del images
 
     print(f"{split}: saved {count:,} images to {output} (skipped {skipped:,})")
     return count, skipped
-
-
-def process_symbol_sample(sample):
-    """Load and preprocess one rendered CROHME symbol."""
-    path, label = sample
-
-    try:
-        if not label:
-            raise ValueError("Empty symbol label")
-
-        with Image.open(path) as image:
-            grayscale = np.asarray(image.convert("L"), dtype=np.uint8)
-
-        processed = preprocess_symbol_image(grayscale)
-        return processed, None
-
-    except (OSError, ValueError, cv2.error) as error:
-        return None, str(error)
-
-
-def preprocess_symbol_split(split: str, workers: int = NUM_WORKERS):
-    """Combine preprocessed symbols into one NPZ per split."""
-    split_folder = DATASETS_ROOT / "symbol" / split
-    png_folder = split_folder / "CROHME23" / "PNG"
-    csv_path = png_folder / "labels.csv"
-
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Missing symbol labels: {csv_path}")
-
-    with csv_path.open(newline="", encoding="utf-8-sig") as file:
-        reader = csv.DictReader(file)
-        if not {"image", "label"}.issubset(reader.fieldnames or []):
-            raise ValueError(f"Expected image,label columns in {csv_path}")
-
-        samples = [(png_folder / row["image"], row["label"].strip()) for row in reader]
-
-    if not samples:
-        raise ValueError(f"No symbols found in {csv_path}")
-
-    labels, sources = [], []
-    skipped = 0
-
-    with tempfile.TemporaryDirectory(dir=split_folder) as temp:
-        images = np.lib.format.open_memmap(
-            Path(temp) / "images.npy",
-            mode="w+",
-            dtype=np.uint8,
-            shape=(len(samples), IMAGE_HEIGHT, SYMBOL_WIDTH),
-        )
-
-        try:
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=configure_worker,
-            ) as pool:
-                for start in range(0, len(samples), WORK_BATCH_SIZE):
-                    batch = samples[start : start + WORK_BATCH_SIZE]
-
-                    results = pool.map(
-                        process_symbol_sample,
-                        batch,
-                        chunksize=WORK_CHUNK_SIZE,
-                    )
-
-                    for (path, label), (processed, error) in zip(batch, results):
-                        if error is not None:
-                            skipped += 1
-                            if skipped <= 5:
-                                print(f"Skipped {path}: {error}")
-                            continue
-
-                        index = len(labels)
-                        images[index] = processed
-                        labels.append(label)
-                        sources.append(path.relative_to(split_folder).as_posix())
-
-            count = len(labels)
-            if not count:
-                raise ValueError(f"No valid symbols in {split}")
-
-            images.flush()
-            output = split_folder / OUTPUT_FILENAME
-
-            np.savez_compressed(
-                output,
-                images=images[:count],
-                labels=np.asarray(labels, dtype=np.str_),
-                sources=np.asarray(sources, dtype=np.str_),
-            )
-
-        finally:
-            del images
-
-    print(f"Symbol {split}: saved {count:,} images to {output} (skipped {skipped:,})")
 
 
 def main() -> None:
@@ -434,7 +302,6 @@ def main() -> None:
 
     for split in SPLITS:
         preprocess_split(split, workers=args.workers)
-        preprocess_symbol_split(split, workers=args.workers)
 
 
 if __name__ == "__main__":

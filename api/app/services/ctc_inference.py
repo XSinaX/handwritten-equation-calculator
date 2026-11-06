@@ -1,7 +1,9 @@
 """Inference for the three end-to-end image-to-CTC model pairs."""
 
 from functools import lru_cache
+import importlib
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -33,6 +35,8 @@ def load_model(model_name: str):
         raise HTTPException(status_code=404, detail=f"Model checkpoint not found: {model_path.name}")
 
     try:
+        # workaround for changing the import path of the model class when loading a checkpoint
+        sys.modules.setdefault("ml.models", importlib.import_module("ml.end_to_end"))
         model = torch.load(model_path, map_location="cpu", weights_only=False)
         model = model.to(DEVICE)
         model.eval()

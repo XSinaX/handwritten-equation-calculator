@@ -8,9 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from PIL import Image
 
 from ml.end_to_end.ctc.ctc_loss import EquationCTCLoss
 from ml.end_to_end.ctc.decoder import greedy_decode
@@ -18,28 +16,12 @@ from ml.end_to_end.ctc.tokenizer import CTCTokenizer
 from ml.end_to_end.equation_recognition_model import EquationRecognitionModel
 from ml.end_to_end.evaluation import edit_distance
 
-
-from ml.config import IMAGE_HEIGHT, IMAGE_WIDTH, SYMBOL_WIDTH, TOKENS, BLANK_TOKEN
-from ml.segmentation_based.models import create_model as create_symbol_model
-from ml.preprocessing import preprocess_symbol_image
-from ml.segmentation_based.segmentation import SEGMENTATION_METHODS
-
 MODEL_PAIRS = {
     "cnn-gru": ("cnn", "gru"),
     "resnet-bilstm": ("resnet", "bilstm"),
     "vit-transformer": ("vision_transformer", "transformer"),
 }
-SEGMENTATION_PAIRS = {
-    f"seg-{method}-{classifier}": (method, classifier)
-    for method in ("cca", "vp", "aug")
-    for classifier in ("cnn", "resnet")
-}
-SEGMENTATION_NAMES = {
-    "cca": "cca",
-    "vp": "vertical_projection",
-    "aug": "augmented_CCL",
-}
-MODEL_CHOICES = {**MODEL_PAIRS, **SEGMENTATION_PAIRS}
+MODEL_CHOICES = {**MODEL_PAIRS}
 DEFAULT_MODEL = "cnn-gru"
 
 IMAGE_MODEL, SEQUENCE_MODEL = MODEL_PAIRS[DEFAULT_MODEL]
@@ -61,12 +43,8 @@ NUM_WORKERS = 0
 ML_ROOT = Path(__file__).resolve().parent
 DATASETS_ROOT = ML_ROOT / "datasets" / "equation"
 MODEL_FOLDER = ML_ROOT / "trained_models"
-SYMBOL_DATA_ROOT = ML_ROOT / "datasets" / "symbol"
-SYMBOL_TOKENS = tuple(token for token in TOKENS if token != BLANK_TOKEN)
-SYMBOL_BATCH_SIZE = 128
 RESULTS_FILE = MODEL_FOLDER / "results.json"
 PREDICTIONS_FILE = MODEL_FOLDER / "test_predictions.csv"
-SYMBOL_WEIGHT_DECAY = 1e-4
 
 
 class EquationDataset(Dataset):
@@ -122,8 +100,6 @@ def train_one_epoch(model, loader, tokenizer, criterion, optimizer, device) -> f
         logits = model(images)
         loss = criterion(logits, targets, target_lengths)
 
-        # Reuse this forward pass to report training accuracy without an extra
-        # whole-dataset evaluation; this is an online, train-mode measurement.
         with torch.no_grad():
             correct += sequence_accuracy(logits, labels, tokenizer)
             total += len(labels)
@@ -241,8 +217,6 @@ def train_end_to_end(model_name: str, device: torch.device) -> None:
         min_lr=MIN_LEARNING_RATE,
     )
 
-    # Use the existing checkpoint naming for compatibility with the API and
-    # ml.evaluate, both of which load a fully serialized PyTorch model.
     checkpoint_path = MODEL_FOLDER / f"{image_name}-{sequence_name}.pt"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     best_accuracy = -1.0
@@ -266,8 +240,6 @@ def train_end_to_end(model_name: str, device: torch.device) -> None:
             f"Val Loss: {validation_loss:.4f}"
         )
 
-        # Select the checkpoint by exact-sequence validation accuracy, breaking
-        # ties using validation loss. Never select based on test performance.
         improved_accuracy = validation_accuracy > best_accuracy
         better_checkpoint = improved_accuracy or (
             validation_accuracy == best_accuracy and validation_loss < best_checkpoint_loss
@@ -349,188 +321,6 @@ def train_end_to_end(model_name: str, device: torch.device) -> None:
     print(f"Metrics: {RESULTS_FILE} | Predictions: {PREDICTIONS_FILE}")
 
 
-class SymbolDataset(Dataset):
-    """Read preprocessed symbol images and labels from one NPZ."""
-
-    def __init__(self, split: str):
-        path = SYMBOL_DATA_ROOT / split / "preprocessed.npz"
-
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing {path}; run python -m ml.preprocessing first")
-
-        with np.load(path, allow_pickle=False) as archive:
-            self.images = archive["images"]
-            labels = archive["labels"]
-
-        if (
-            self.images.ndim != 3
-            or self.images.shape[1:] != (IMAGE_HEIGHT, SYMBOL_WIDTH)
-            or self.images.dtype != np.uint8
-            or labels.ndim != 1
-            or len(self.images) != len(labels)
-            or len(labels) == 0
-        ):
-            raise ValueError(f"Invalid symbol dataset: {path}")
-
-        label_to_id = {token: index for index, token in enumerate(SYMBOL_TOKENS)}
-
-        self.targets = np.asarray(
-            [label_to_id[str(label)] for label in labels],
-            dtype=np.int64,
-        )
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, index):
-        image = self.images[index].astype(np.float32)
-
-        # Symbol classifier: black=1, white=0.
-        image = torch.from_numpy(1.0 - image / 255.0)
-
-        return image.unsqueeze(0), int(self.targets[index])
-
-
-def symbol_epoch(model, loader, criterion, device, optimizer=None) -> tuple[float, float]:
-    """Return weighted mean loss and token-level classification accuracy."""
-    training = optimizer is not None
-    model.train(training)
-    total_loss, correct, total = 0.0, 0, 0
-
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(training):
-            logits = model(images)
-            loss = criterion(logits, labels)
-            if training:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
-                optimizer.step()
-        total_loss += loss.item() * len(labels)
-        correct += (logits.argmax(dim=1) == labels).sum().item()
-        total += len(labels)
-
-    return total_loss / total, correct / total
-
-
-def train_symbol_classifier(classifier: str, device: torch.device) -> None:
-    """Train only the classifier; segmentation itself has no learned weights."""
-    train_data = SymbolDataset("train")
-    validation_data = SymbolDataset("validation")
-    train_loader = DataLoader(
-        train_data,
-        batch_size=SYMBOL_BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = DataLoader(
-        validation_data,
-        batch_size=SYMBOL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-    )
-
-    model = create_symbol_model(classifier, len(SYMBOL_TOKENS)).to(device)
-    counts = np.bincount(train_data.targets, minlength=len(SYMBOL_TOKENS))
-    missing = [SYMBOL_TOKENS[i] for i, count in enumerate(counts) if not count]
-    if missing:
-        raise ValueError(f"Missing symbol training classes: {missing}")
-    weights = 1.0 / np.sqrt(counts.astype(np.float64))
-    weights /= weights.mean()
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=SYMBOL_WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=LR_REDUCE_FACTOR,
-        patience=LR_REDUCE_PATIENCE,
-        min_lr=MIN_LEARNING_RATE,
-    )
-
-    MODEL_FOLDER.mkdir(parents=True, exist_ok=True)
-    checkpoint = MODEL_FOLDER / f"symbol-{classifier}.pt"
-    best_accuracy, best_loss, best_epoch = -1.0, float("inf"), 0
-    stopping_loss, no_improvement = float("inf"), 0
-    print(
-        f"Symbol classifier: {classifier} | Train: {len(train_data):,} | "
-        f"Validation: {len(validation_data):,} | Classes: {len(SYMBOL_TOKENS)}"
-    )
-
-    for epoch in range(1, EPOCHS + 1):
-        train_loss, train_accuracy = symbol_epoch(model, train_loader, criterion, device, optimizer)
-        val_loss, val_accuracy = symbol_epoch(model, val_loader, criterion, device)
-        print(
-            f"Epoch {epoch:3d}/{EPOCHS} | Train Symbol Acc: {train_accuracy*100:6.2f}% | "
-            f"Val Symbol Acc: {val_accuracy*100:6.2f}% | Val Loss: {val_loss:.4f}"
-        )
-
-        improved_accuracy = val_accuracy > best_accuracy
-        if improved_accuracy or (val_accuracy == best_accuracy and val_loss < best_loss):
-            best_accuracy, best_loss, best_epoch = val_accuracy, val_loss, epoch
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "model": classifier,
-                    "vocabulary": list(SYMBOL_TOKENS),
-                    "image_height": IMAGE_HEIGHT,
-                    "image_width": SYMBOL_WIDTH,
-                },
-                checkpoint,
-            )
-
-        scheduler.step(val_loss)
-        if val_loss < stopping_loss - EARLY_STOPPING_MIN_DELTA or improved_accuracy:
-            stopping_loss = min(stopping_loss, val_loss)
-            no_improvement = 0
-        else:
-            no_improvement += 1
-            if no_improvement >= EARLY_STOPPING_PATIENCE:
-                print(f"Early stopping after {epoch} epochs.")
-                break
-
-    print(f"Best symbol epoch: {best_epoch} | Val Symbol Acc: {best_accuracy * 100:.2f}%")
-    print(f"Best symbol checkpoint: {checkpoint}")
-    saved = torch.load(checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(saved["model_state_dict"])
-    test_data = SymbolDataset("test")
-    test_loader = DataLoader(
-        test_data,
-        batch_size=SYMBOL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-    )
-    _, test_accuracy = symbol_epoch(model, test_loader, criterion, device)
-    print(f"Test Symbol Accuracy (n={len(test_data):,}): {test_accuracy * 100:.2f}%")
-
-    # Saved under the shared metrics file, with separate classifier metrics.
-    save_model_result(
-        f"symbol-{classifier}",
-        {
-            "architecture": "symbol_classifier",
-            "model": classifier,
-            "image_height": IMAGE_HEIGHT,
-            "image_width": SYMBOL_WIDTH,
-            "batch_size": SYMBOL_BATCH_SIZE,
-            "training_samples": len(train_data),
-            "validation_samples": len(validation_data),
-            "test_samples": len(test_data),
-            "best_epoch": best_epoch,
-            "epochs_trained": epoch,
-            "validation_symbol_accuracy": best_accuracy,
-            "validation_symbol_loss": best_loss,
-            "test_symbol_accuracy": test_accuracy,
-            "checkpoint": str(checkpoint.relative_to(ML_ROOT)),
-        },
-    )
-    print(f"Metrics saved to: {RESULTS_FILE}")
-
-
 def save_model_result(model_name: str, metrics: dict) -> None:
     """Update only one model's record in the consolidated results JSON."""
     RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -584,129 +374,12 @@ def write_test_predictions(model_name, sources, equations, predictions, normaliz
         writer.writerows(rows.values())
 
 
-def tokenize_equation(equation: str, tokenizer: CTCTokenizer) -> list[int]:
-    """Use the end-to-end vocabulary for sequence-level comparisons."""
-    return tokenizer.encode(equation)
-
-
-@torch.no_grad()
-def evaluate_segmented_equations(
-    classifier: str,
-    segmentation: str,
-    split: str,
-    device: torch.device,
-    collect_predictions: bool = False,
-):
-    """Evaluate a fixed segmentation method + trained classifier on whole equations.
-
-    No segmentation training occurs. Evaluate with the SAME preprocessed NPZ
-    equations used by the end-to-end models for a fair comparison.
-    """
-    dataset = EquationDataset(split)
-    checkpoint_path = MODEL_FOLDER / f"symbol-{classifier}.pt"
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Symbol classifier not trained: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    vocabulary = checkpoint.get("vocabulary")
-    if not vocabulary:
-        raise ValueError(f"Checkpoint has no token vocabulary: {checkpoint_path}")
-    if tuple(vocabulary) != SYMBOL_TOKENS:
-        raise ValueError(f"Checkpoint token order differs from current config: {checkpoint_path}")
-    if (checkpoint.get("image_height"), checkpoint.get("image_width")) != (IMAGE_HEIGHT, SYMBOL_WIDTH):
-        raise ValueError(f"Checkpoint dimensions do not match symbol config: {checkpoint_path}")
-    model = create_symbol_model(classifier, len(vocabulary)).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    method = SEGMENTATION_NAMES[segmentation]
-    segmenter = SEGMENTATION_METHODS[method]
-    tokenizer = CTCTokenizer()
-    correct, edits, target_length = 0, 0, 0
-    predictions = []
-    for index in range(len(dataset)):
-        segments = segmenter(dataset.images[index])
-        if segments:
-            batch = np.stack([preprocess_symbol_image(segment.image) for segment in segments])
-            tensor = torch.from_numpy(1.0 - batch.astype(np.float32) / 255.0).unsqueeze(1).to(device)
-            ids = model(tensor).argmax(dim=1).cpu().tolist()
-            prediction = "".join(vocabulary[token_id] for token_id in ids)
-        else:
-            prediction = ""
-        label = str(dataset.equations[index])
-        target = tokenize_equation(label, tokenizer)
-        predicted = tokenize_equation(prediction, tokenizer)
-        correct += predicted == target
-        edits += edit_distance(predicted, target)
-        target_length += len(target)
-        if collect_predictions:
-            predictions.append(prediction)
-        if (index + 1) % 500 == 0:
-            print(f"  {split} {method}/{classifier}: {index+1:,}/{len(dataset):,}", flush=True)
-    return (
-        {
-            "sequence_accuracy": correct / len(dataset),
-            "token_error_rate": edits / target_length if target_length else None,
-            "samples": len(dataset),
-        },
-        predictions,
-        dataset,
-    )
-
-
-def evaluate_segmentation_selection(selection: str, device: torch.device) -> None:
-    method, classifier = SEGMENTATION_PAIRS[selection]
-    print(f"Evaluating {selection} on whole-equation validation/test splits")
-    validation, _, _ = evaluate_segmented_equations(classifier, method, "validation", device)
-    test, predictions, dataset = evaluate_segmented_equations(
-        classifier, method, "test", device, collect_predictions=True
-    )
-    classifier_metrics = json.loads(RESULTS_FILE.read_text(encoding="utf-8")).get(f"symbol-{classifier}", {})
-    save_model_result(
-        selection,
-        {
-            "architecture": "segmentation_based",
-            "model": selection,
-            "segmentation_method": SEGMENTATION_NAMES[method],
-            "classifier": classifier,
-            "image_height": int(dataset.images.shape[1]),
-            "image_width": int(dataset.images.shape[2]),
-            "symbol_height": IMAGE_HEIGHT,
-            "symbol_width": SYMBOL_WIDTH,
-            "batch_size": SYMBOL_BATCH_SIZE,
-            "training_samples": classifier_metrics.get("training_samples"),
-            "validation_samples": validation["samples"],
-            "test_samples": test["samples"],
-            "best_epoch": classifier_metrics.get("best_epoch"),
-            "epochs_trained": classifier_metrics.get("epochs_trained"),
-            "validation_sequence_accuracy": validation["sequence_accuracy"],
-            # This loss is the symbol classifier's cross entropy, NOT a sequence loss.
-            "validation_loss": classifier_metrics.get("validation_symbol_loss"),
-            "validation_loss_type": "symbol_cross_entropy",
-            "validation_token_error_rate": validation["token_error_rate"],
-            "test_sequence_accuracy": test["sequence_accuracy"],
-            "test_loss": None,
-            "test_token_error_rate": test["token_error_rate"],
-            "classifier_validation_symbol_accuracy": classifier_metrics.get("validation_symbol_accuracy"),
-            "classifier_validation_symbol_loss": classifier_metrics.get("validation_symbol_loss"),
-            "classifier_test_symbol_accuracy": classifier_metrics.get("test_symbol_accuracy"),
-            "checkpoint": str((MODEL_FOLDER / f"symbol-{classifier}.pt").relative_to(ML_ROOT)),
-        },
-    )
-    write_test_predictions(selection, dataset.sources, dataset.equations, predictions)
-    print(f"  Validation sequence accuracy: {validation['sequence_accuracy']:.2%}")
-    print(f"  Test sequence accuracy: {test['sequence_accuracy']:.2%} | Test TER: {test['token_error_rate']:.2%}")
-    print(f"Metrics: {RESULTS_FILE} | Predictions: {PREDICTIONS_FILE}")
-
-
 def main(model_names: list[str], gpu_index: int | None = None) -> None:
-    """Train each distinct classifier once, then evaluate requested full pipelines."""
     bad = sorted(set(model_names) - set(MODEL_CHOICES))
     if bad:
         raise ValueError(f"Unknown model(s): {bad}; choose from {list(MODEL_CHOICES)}")
     device = choose_device(gpu_index)
     torch.backends.cudnn.benchmark = device.type == "cuda"
-    trained_classifiers = set()
-    # Train only two symbol classifiers even when six segmentation combinations
-    # are selected. Evaluate all requested full pipelines afterward.
     for selection in dict.fromkeys(model_names):
         random.seed(RANDOM_SEED)
         torch.manual_seed(RANDOM_SEED)
@@ -714,22 +387,14 @@ def main(model_names: list[str], gpu_index: int | None = None) -> None:
         print(f"\n{'='*65}\nSelected: {selection}\n{'='*65}", flush=True)
         if selection in MODEL_PAIRS:
             train_end_to_end(selection, device)
-        else:
-            _, classifier = SEGMENTATION_PAIRS[selection]
-            if classifier not in trained_classifiers:
-                train_symbol_classifier(classifier, device)
-                trained_classifiers.add(classifier)
-            else:
-                print(f"Reusing trained {classifier} symbol checkpoint")
-            evaluate_segmentation_selection(selection, device)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train end-to-end models and/or symbol classifiers")
+    parser = argparse.ArgumentParser(description="Train end-to-end models")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--model", choices=tuple(MODEL_CHOICES), help="Train one selected model")
     selection.add_argument("--models", nargs="+", choices=tuple(MODEL_CHOICES), help="Train selections sequentially")
-    parser.add_argument("--all", action="store_true", help="Run all 9 model selections")
+    parser.add_argument("--all", action="store_true", help="Run all model selections")
     parser.add_argument("--gpu", type=int, default=None, help="CUDA/ROCm GPU index")
     args = parser.parse_args()
     main(list(MODEL_CHOICES) if args.all else (args.models or [args.model or DEFAULT_MODEL]), gpu_index=args.gpu)

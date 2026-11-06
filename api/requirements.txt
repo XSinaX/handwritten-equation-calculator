@@ -1,9 +1,7 @@
-fastapi
-uvicorn
-python-multipart
-numpy
-pillow
-python-dotenv
-opencv-python        
-torch #TODO: if we want to go with diffrent deployment method, remove this
-httpx  # only needed for api/tests (in-process API testing)
+Jinja2==3.1.6
+fastapi==0.142.2
+opencv-python==5.0.0.93
+pip-chill==1.0.5
+pydantic_core==2.46.5
+torchvision==0.29.2+cpu
+uvicorn==0.54.0

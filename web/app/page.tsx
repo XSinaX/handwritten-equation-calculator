@@ -26,8 +26,8 @@ export default function Home() {
             { label: 'Vision Transformer + Transformer', value: 'vit-transformer' },
         ],
         segmentation: [
-            { label: 'Augmented CCL + CNN', value: 'seg-aug-cnn' },
-            { label: 'Augmented CCL + ResNet', value: 'seg-aug-resnet' },
+            { label: 'CCL – Geometry MLP – ResNet', value: 'ccl_geometry_mlp_resnet' },
+            { label: 'CCL + Stroke-Width Cutting – Geometry MLP – ResNet', value: 'ccl_stroke_width_geometry_mlp_resnet' },
         ],
     };
 
