@@ -6,7 +6,7 @@ api_venv/
 ml_venv/
 
 # ML Data
-/ml/datasets/
+datasets/
 
 # Next.js
 node_modules/
@@ -32,3 +32,5 @@ Thumbs.db
 
 # Kaggle training package
 /kaggle_training.zip
+# other files
+test/*

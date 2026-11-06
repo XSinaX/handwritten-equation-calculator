@@ -61,5 +61,25 @@
     "test_loss": 0.07811630203974754,
     "test_token_error_rate": 0.019242635136104694,
     "checkpoint": "trained_models\\cnn-gru.pt"
+  },
+  "vit-transformer": {
+    "architecture": "end_to_end",
+    "model": "vit-transformer",
+    "image_height": 128,
+    "image_width": 1024,
+    "batch_size": 32,
+    "training_samples": 30809,
+    "validation_samples": 5108,
+    "test_samples": 5180,
+    "best_epoch": 49,
+    "epochs_trained": 59,
+    "validation_sequence_accuracy": 0.8424040720438528,
+    "validation_loss": 0.08106545684020455,
+    "validation_loss_type": "ctc",
+    "validation_token_error_rate": 0.014377634790326159,
+    "test_sequence_accuracy": 0.788996138996139,
+    "test_loss": 0.0973261447716864,
+    "test_token_error_rate": 0.019730517011293032,
+    "checkpoint": "trained_models\\vision_transformer-transformer.pt"
   }
 }
